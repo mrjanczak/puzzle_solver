@@ -1,6 +1,13 @@
+"""Puzzle solver
+
+author: Michal Janczak
+"""
 import os
 import sys
+import copy
+import math 
 import numpy as np
+import pandas as pd
 import cv2 as cv
 import pickle
 import matplotlib.pyplot as plt
@@ -8,344 +15,573 @@ import scipy.ndimage as ndimage
 import scipy.ndimage.filters as filters
 from scipy.spatial.distance import euclidean
 from scipy.signal import find_peaks
+from scipy.signal import medfilt
 from scipy.signal import savgol_filter
-from fastdtw import fastdtw
+from shapely.geometry import Point, LineString
 
-local = os.path.dirname(__file__)
-# puzzle size
-M, N = 40, 25
+def _get_angle(v1, v2):
+    # Compute cosine of angle using dot product
 
-def get_corners(harris_corners, neighborhood_size=5, score_threshold=0.3, minmax_threshold=100):
+    dot_product = np.dot(v1, v2)  # Dot product
+    cross_product = np.cross(v1, v2)  # Determinant (cross product in 2D)    
+    angle_rad = np.arctan2(cross_product, dot_product)  # Signed angle in radians
+
+    return angle_rad
+
+def _get_contour(file, num_points, 
+                 gauss_blur, eps_ratio, noise_treshold, savgol_kwargs):
     
-    """
-    Given the input Harris image (where in each pixel the Harris function is computed),
-    extract discrete corners
-    """
-    data = harris_corners.copy()
-    data[data < score_threshold*harris_corners.max()] = 0.
+    img = cv.imread(file)
+    gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+    blur = cv.GaussianBlur(gray,gauss_blur,0)
+    _,thresh = cv.threshold(blur,0,255,cv.THRESH_BINARY+cv.THRESH_OTSU)    
+    thresh = cv.bitwise_not(thresh)
+    ret, labels = cv.connectedComponents(thresh)
+    connected_areas = [np.count_nonzero(labels == l) for l in range(1, ret)]
+    max_area_idx = np.argmax(connected_areas) + 1
+    gray[labels != max_area_idx] = 0
+    gray[labels == max_area_idx] = 255
+    
+    # Find simplified contour
+    _,thresh = cv.threshold(blur,0,255,cv.THRESH_BINARY+cv.THRESH_OTSU)    
+    thresh = cv.bitwise_not(thresh)    
+    cnts, _ = cv.findContours(thresh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
+    largest_cnt = max(cnts, key=cv.contourArea)        
+    epsilon = eps_ratio * cv.arcLength(largest_cnt, True)
+    appx_cnt = cv.approxPolyDP(largest_cnt, epsilon, True)
 
-    data_max = filters.maximum_filter(data, neighborhood_size)
-    maxima = (data == data_max)
-    data_min = filters.minimum_filter(data, neighborhood_size)
-    diff = ((data_max - data_min) > minmax_threshold)
-    maxima[diff == 0] = 0
+    # Convert contour to NumPy format and compute cumulative distances along the curve
+    appx_cnt = np.reshape(appx_cnt, (-1, 2))  # Remove unnecessary dimensions
+    curve = np.vstack([appx_cnt, appx_cnt[0]])  # Close the contour
+    s = np.cumsum(np.sqrt(np.sum(np.diff(curve, axis=0)**2, axis=1)))
+    s = np.insert(s, 0, 0)  # Insert starting point
 
-    labeled, num_objects = ndimage.label(maxima)
-    yx = np.array(ndimage.center_of_mass(data, labeled, range(1, num_objects+1)))
+    # Interpolate points at evenly spaced distances
+    int_cnt = np.zeros((num_points+1, 2), dtype=np.float32)
+    for i, d in enumerate(np.linspace(0, s[-1], num_points+1)):
+        idx = np.searchsorted(s, d)
+        t = (d - s[idx-1]) / (s[idx] - s[idx-1]) if idx > 0 else 0
+        int_cnt[i] = (1 - t) * curve[idx-1] + t * curve[idx]
 
-    return yx[:, ::-1]
+    # Convert back to contour format
+    cnt = int_cnt[:num_points].astype(np.int32)
+    cnt_rect = cv.boundingRect(cnt.reshape(-1, 1, 2))
 
-def unit_vector(vector):
-    """ Returns the unit vector of the vector.  """
-    v_len = np.linalg.norm(vector)
-    if abs(v_len) > 1e-3:
-        return vector / v_len
+    # Compute the signed area using Shoelace formula
+    area = 0.5 * np.sum(cnt[:-1, 0] * cnt[1:, 1] - cnt[1:, 0] * cnt[:-1, 1])
+    if area > 0:  # True if CW
+        cnt = cnt[::-1]  # Reverse order to make CCW
+    
+    # Prepare preview
+    preview = cv.cvtColor(gray, cv.COLOR_GRAY2BGR)
+    cv.drawContours(preview, [cnt.reshape(-1, 1, 2)], -1, (0, 255, 0), 3)
+
+    # Compute cumulative distances
+    cnt2 = np.vstack([cnt, cnt])  
+    s2 = np.cumsum(np.sqrt(np.sum(np.diff(cnt2, axis=0)**2, axis=1)))
+    s2 = np.insert(s2, 0, 0)  # Insert starting point
+
+    # Compute angle and line/non-line points ratio
+    a2 = np.zeros(num_points*2)
+    for i in range(1, num_points*2-1):  # Avoid first & last points
+        p1 = cnt2[i - 1]  # Previous point
+        p2 = cnt2[i]      # Current point
+        p3 = cnt2[i + 1]  # Next point
+
+        # Compute vectors
+        v1 = p2 - p1
+        v2 = p3 - p2
+        
+        angle = _get_angle(v1, v2)           
+        a2[i] = np.degrees(angle)           
+
+    # Cummulated angle
+    ca2_raw = np.cumsum(a2, axis = 0)
+
+    # Filter noise
+    ca2_filtered = ca2_raw.copy()
+    for i in range(1, num_points - 1):  # Ignore first and last point
+        dca1 = ca2_filtered[i] - ca2_filtered[i - 1]
+        dca2 = ca2_filtered[i+1] - ca2_filtered[i]
+        dca_avg = (abs(dca1) + abs(dca2)) / 2
+        if np.sign(dca1) * np.sign(dca2) == -1 and dca_avg > noise_treshold:     # Detected outlier
+            ca2_filtered[i] = (ca2_filtered[i - 1] + ca2_filtered[i + 1]) / 2  # Replace with mean of neighbors 
+
+    cum_a2 = savgol_filter(ca2_filtered, **savgol_kwargs) 
+
+    return cnt2, s2, cum_a2, preview, cnt_rect, ca2_raw, ca2_filtered
+
+def _get_locks(num_points, cnt2, s2, cum_a2, 
+              lock_n_ratio, lock_s_range, lock_cum_a_range, 
+              lock_max_mse, lock_edge_max_dca,
+              lock_pc_crit, corners = None):
+
+    lock_n = int(num_points/4*lock_n_ratio)
+
+    locks_p0 = []
+    locks_pc = []
+    locks_p12 = []
+    locks_p34 = []
+
+    locks_crit = []
+    locks_sca_p0 = []
+    locks_sca_p12 = []
+    locks_sca_p34 = []
+
+    locks = []
+    lock_s_range_ = s2[num_points]/4. * np.array(lock_s_range)
+    
+    i = lock_n - 1
+    for _ in range(lock_n, num_points*2 - lock_n):
+        i += 1
+        
+        # End if out of doubled contour
+        if i > num_points*2 - lock_n:
+            break
+
+        lock_cum_a = cum_a2[i - lock_n : i + lock_n]
+        lock_i_max = np.argmax(lock_cum_a)
+        lock_i_min = np.argmin(lock_cum_a)
+        i1 = i - lock_n + min(lock_i_min, lock_i_max) 
+        i2 = i - lock_n + max(lock_i_min, lock_i_max)  
+
+        if corners:
+            skip_i = False
+            for corner in corners:
+                if i1 <= corner['i'] <= i2:
+                    skip_i = True
+            if skip_i:
+                continue
+
+        d_s = s2[i2] - s2[i1]
+        d_cum_a = cum_a2[i2] - cum_a2[i1]
+        lock_dir = -np.sign(d_cum_a)
+
+        d_s_ratio =     float((abs(d_s) - lock_s_range_[0])/np.diff(lock_s_range_))
+        d_cum_a_ratio = float((abs(d_cum_a) - lock_cum_a_range[0])/np.diff(lock_cum_a_range))
+
+        # Continue if s or angle range out of range
+        if not (0 < d_s_ratio < 1 and 0 < d_cum_a_ratio < 1):
+            continue
+
+        # Extend lock range to actual peak            
+        for j in range(i1-1, i1-lock_n, -1):
+            if j < 0: break 
+            if cum_a2[j]*lock_dir > cum_a2[j+1]*lock_dir:
+                i1 = j
+            else: break
+        
+        for j in range(i2+1, i2+lock_n, 1):  
+            if j > num_points*2: break  
+            if cum_a2[j-1]*lock_dir > cum_a2[j]*lock_dir:
+                i2 = j
+            else: break
+
+        # Check circularity of lock by mse
+        x = s2[i1 : i2]
+        y = cum_a2[i1 : i2]
+        a, b = np.polyfit(x, y, 1)  # 1 means linear fit
+        line = a*x + b
+        mse = np.mean((y - line) ** 2) 
+        mse_ratio =  mse/lock_max_mse
+
+        # Reject potential locks not matching to peak-to-peak line
+        if not (mse_ratio < 1):
+            continue
+
+        # Move index i to middle point of lock and calc center of lock - pc
+        i =   int((i1 + i2) / 2)
+            
+        # Extend lock range to point on edge 
+        i3, i4 = i1, i2
+        for j in range(i1-1, i1-lock_n, -1):
+            if j < 0: break 
+            if abs(cum_a2[j] - cum_a2[i]) < lock_edge_max_dca:
+                i3 = j
+                break
+        
+        for j in range(i2+1, i2+lock_n, 1):  
+            if j > num_points*2: break  
+            if abs(cum_a2[j] - cum_a2[i]) < lock_edge_max_dca:
+                i4 = j
+                break
+
+        p0 = cnt2[i]
+        p1, p2, p3, p4 = cnt2[i1], cnt2[i2], cnt2[i3], cnt2[i4]
+        pc = np.mean([p0, p1, p2], axis=0)            
+
+        # Reject potential lock if overlaps previous locks
+        overlap = False
+        for lock_prev in locks:
+            i3_prev = lock_prev['i'][0] 
+            i4_prev = lock_prev['i'][4]
+            pc_prev = lock_prev['pc']
+
+            # Check overlaping locks (not repeated locks)
+            d_pc_ratio = np.linalg.norm(pc-pc_prev)/lock_pc_crit
+            if  d_pc_ratio > 1:
+                if (i3_prev <= i3 - num_points <= i4_prev or 
+                    i3_prev <= i4 - num_points <= i4_prev or 
+                    i3_prev <= i3 <= i4_prev or 
+                    i3_prev <= i4 <= i4_prev):
+                    overlap = True
+                    i = i4
+        if overlap: continue
+
+        locks_pc.append( pc)
+        locks_p0.append( p0)
+        locks_p12.append(p1)
+        locks_p12.append(p2)
+        locks_p34.append(p3)
+        locks_p34.append(p4)
+
+        locks_sca_p0.append( [s2[i],  cum_a2[i]])
+        locks_sca_p12.append([s2[i1], cum_a2[i1]])
+        locks_sca_p12.append([s2[i2], cum_a2[i2]])
+        locks_sca_p34.append([s2[i3], cum_a2[i3]])
+        locks_sca_p34.append([s2[i4], cum_a2[i4]])
+
+        lock_crit = [s2[i], d_s_ratio, d_cum_a_ratio, mse_ratio]
+        locks_crit.append(lock_crit) 
+
+        lock = {'i': [i3, i1, i, i2, i4], 'dir': lock_dir, 'pc': pc}
+        locks.append(lock)                   
+
+        # Jump to next lock
+        i += lock_n
+
+    locks_pc =  np.array(locks_pc).reshape(-1, 2)
+    locks_p0 =  np.array(locks_p0).reshape(-1, 2)
+    locks_p12 = np.array(locks_p12).reshape(-1, 2)
+    locks_p34 = np.array(locks_p34).reshape(-1, 2)
+    locks_p = (locks_pc, locks_p0, locks_p12, locks_p34)
+
+    locks_sca_p0 =  np.array(locks_sca_p0).reshape(-1, 2)
+    locks_sca_p12 = np.array(locks_sca_p12).reshape(-1, 2)      
+    locks_sca_p34 = np.array(locks_sca_p34).reshape(-1, 2)      
+    locks_sca = (locks_sca_p0, locks_sca_p12, locks_sca_p34) 
+
+    locks_crit =    np.array(locks_crit).reshape(-1, 4)
+
+    return locks, locks_p, locks_sca, locks_crit
+
+def _get_lines(num_points, cnt2, s2, cum_a2, locks, line_n_ratio, line_max_mse):
+    # Find lines - stright parts of edges out of locks
+    line_n = int(num_points/4*line_n_ratio)
+    lines = []
+    lines_cnt2 = []
+    lines_crit = []
+
+    # Start after first lock
+    i = locks[0]['i'][-1]
+    for _ in range(line_n, num_points*2 - line_n):
+        i += 1
+
+        # Skip locks
+        for lock in locks:
+            if lock['i'][0] <= i <= lock['i'][-1]:
+                i = lock['i'][-1]
+                break
+
+            if lock['i'][0] <= i - num_points <= lock['i'][-1]:
+                i = lock['i'][-1] + num_points
+                break
+
+        if i >= num_points*2-line_n-1: break
+        
+        line_cum_a = cum_a2[i-line_n : i+line_n+1]
+        avg_line = np.average(line_cum_a)
+        line_mse_ratio = np.mean((line_cum_a - avg_line) ** 2) / line_max_mse
+
+        if line_mse_ratio < 1:
+            p1 = np.mean(cnt2[i-line_n : i+1], axis= 0)
+            p2 = np.mean(cnt2[i : i+line_n+1], axis= 0)
+            lines.append({'i': i, 's': s2[i], 'ca': avg_line, 'p1': p1, 'p2': p2, 'mser': line_mse_ratio})
+            lines_cnt2.append(cnt2[i])
+            lines_crit.append([s2[i], line_mse_ratio, cum_a2[i]])
+
+    lines_cnt2 = np.array(lines_cnt2).reshape(-1, 2)
+    lines_crit = np.array(lines_crit).reshape(-1, 3)
+
+    return lines, lines_cnt2, lines_crit
+
+def _select_corners(num_points, cnt2, s2, cum_a2):
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    # Set plot limits and aspect ratio
+    ax.plot(cnt2[:, 0], cnt2[:, 1], color="blue", marker=".")
+    ax.set_aspect("equal")
+    ax.set_title("Click on the 4 real corners of the piece")
+    plt.draw()
+
+    corners_cnt = plt.ginput(4, timeout=0)  
+    corners_cnt2 = np.array(corners_cnt).reshape(-1, 2)
+    plt.scatter(*zip(*corners_cnt2), color='red', marker='x', s=100, label="Selected Corners")
+    
+    plt.close()
+
+    # Correct corner in contour cnt2
+    corners_i = []
+    for corner_cnt in corners_cnt2:
+        distances = np.linalg.norm(cnt2[:num_points] - corner_cnt, axis=1)
+        corner_i = np.argmin(distances)        
+        corners_i.append(corner_i)
+        cnt2[corner_i] = corner_cnt 
+
+    corners_i.sort()
+    corners_i.append(corners_i[0] + num_points)
+
+    corners = []
+    for corner_i in corners_i:       
+        corner = {'i': corner_i, 's': s2[corner_i], 'ca': cum_a2[corner_i]}
+        corners.append(corner)
+
+    return cnt2, corners, corners_cnt2, []
+
+def _get_corners(num_points, cnt2, s2, cum_a2, lines, corner_max_ds, corner_cum_a_range):
+    # Find corners
+    corners = []
+    corners_cnt2 = []
+    corners_crit = []
+    for j in range(len(lines)-1):
+
+        # Check min distance between lines
+        p1 = lines[j+1]['p1']
+        p2 = lines[j]['p2']
+        d_s = np.linalg.norm(p2-p1)
+
+        d_s_ratio = d_s/corner_max_ds
+        d_cum_a = lines[j+1]['ca'] - lines[j]['ca']
+        d_cum_a_ratio = (d_cum_a - corner_cum_a_range[0])/ np.diff(corner_cum_a_range)
+        
+        if not (d_s_ratio < 1 and 0 <= d_cum_a_ratio <= 1):
+            continue
+            
+        i1 = lines[j]['i']
+        i2 = lines[j+1]['i']
+
+        p1 = lines[j]['p1']
+        p2 = lines[j]['p2']
+        p3 = lines[j+1]['p1']
+        p4 = lines[j+1]['p2']
+
+        v1 = p2-p1
+        v2 = p3-p4
+        A, B = p1, p4
+
+        matrix = np.array([v1, -v2]).T  # Coefficients for t1, t2
+        rhs = B - A  # Right-hand side of the equation
+        
+        # Solve for t1, t2 (if determinant is nonzero)
+        t1, t2 = np.linalg.solve(matrix, rhs)
+        corner_cnt = A + t1 * v1  # Compute intersection point
+        corners_cnt2.append(corner_cnt)
+
+        # Correct corner in contour cnt2
+        distances = np.linalg.norm(cnt2[i1:i2] - corner_cnt, axis=1)
+        corner_i = i1 + np.argmin(distances)
+        cnt2[corner_i] = corner_cnt
+
+        s = (lines[j+1]['s'] + lines[j]['s'])/2
+        ca_avg = (lines[j+1]['ca'] + lines[j]['ca'])/2
+        line_mse_ratio = lines[j]['mser']
+        corners_crit.append([s, d_s_ratio, d_cum_a_ratio, line_mse_ratio, ca_avg])
+
+        corner = {'i': corner_i, 's': s2[corner_i], 'ca': ca_avg}
+        corners.append(corner)
+
+        if len(corners) == 5:
+            break
+
+    corners_cnt2 = np.array(corners_cnt2).reshape(-1, 2)
+    corners_crit = np.array(corners_crit).reshape(-1, 5)
+
+    return cnt2, corners, corners_cnt2, None
+
+def _get_edges(num_points, cnt2, s2, cum_a2, locks, corners):
+    # Extract edges
+    edges = []
+    flat_edges = []
+    for edge_i, (c1, c2) in enumerate(zip(corners[:4], corners[1:5])):
+        i1, i2 = c1['i'], c2['i']
+
+
+        e_s = s2[i1 : i2+1] - np.mean(s2[i1 : i2+1], axis=0)
+        e_ca = cum_a2[i1 : i2+1] - np.mean(cum_a2[i1 : i2+1], axis=0)
+        e_sca = np.column_stack([e_s, e_ca])
+
+        p1, p2 = cnt2[i1], cnt2[i2]
+        e_len = np.linalg.norm(p2-p1)
+
+        # Compute rotation matrix
+        v1 = p2 - p1            
+        theta = _get_angle(v1, np.array([1,0])) 
+        R = np.array([[np.cos(theta), -np.sin(theta)],
+                        [np.sin(theta),  np.cos(theta)]])
+                
+        # Rotate edge contour
+        e_cnt1 = cnt2[i1]
+        e_cnt = cnt2[i1 : i2+1] - e_cnt1
+        e_cnt = np.dot(e_cnt, R.T)
+
+        # Check if any lock occurs at edge
+        lock = None
+        for lock_ in locks:
+            if (i1 <= lock_['i'][2] <= i2) or (i1 <= lock_['i'][2] + num_points <= i2):
+                lock = lock_
+                break
+
+        l_dir, l_pc = 0, None
+        if lock:
+            # Rotate lock center point pc
+            l_dir = lock['dir']
+            l_pc = lock['pc']- e_cnt1
+            l_pc = np.dot(l_pc, R.T)
+        else:
+            flat_edges.append(edge_i)
+
+        edges.append({'p1': p1, 'p2': p2, 'e_cnt': e_cnt, 'e_len': e_len, 'l_dir': l_dir, 'l_pc': l_pc, 'cnt2_range': (i1,i2)}) 
+
+    # Shift edges to start index just after last flat one
+    if len(flat_edges) > 0:
+        e2 = edges + edges
+        edge_i = max(flat_edges)
+        edges = e2[edge_i+1 : edge_i + 5]
+
+    return edges, flat_edges
+
+def _get_p_e(puzzle, r, c):
+    M, N = puzzle.shape
+
+    if not (0 <= r < M and 0 <= c < N):
+        return None, None
+    
+    piece_id = puzzle[r, c]
+    
+    if piece_id >= 0:
+        p_id = math.floor(piece_id)
+        diff = round((piece_id-p_id)*10,0)
+        e_id = int(diff)-1
+        return p_id, e_id
     else:
-        return vector
+        return None, None
 
-def angle(v1, v2):
-    """ Returns the angle in radians between vectors 'v1' and 'v2'"""
-    v1_u = unit_vector(v1)
-    v2_u = unit_vector(v2)
-    # acos = np.arccos(np.clip(np.dot(v1_u, v2_u), -1.0, 1.0))
-    # asin = np.arcsin(np.clip(np.cross(v1_u, v2_u), -1.0, 1.0)) 
+def _offset_edge(e_id, e_off):
+    e_id += e_off
+    if e_id > 3:
+        e_id -= 4
+    if e_id < 0:
+        e_id += 4
+    return e_id
 
-    acos = np.arccos(np.dot(v1_u, v2_u))
-    asin = np.arcsin(np.cross(v1_u, v2_u))
-    return acos*np.sign(asin)*180/np.pi
-
-def get_pieces( dir = 'img', pieces = [], plot_piece = True,
+def process_pieces( pieces_dir = None, files_range = None,
+                pieces = {}, pieces_file = None, p_set = 0, select_corners = [], locks_range = [2,4],
+                plot_piece = False, 
+                p_i_start = 0, 
+                p_set_mult = 100,
                 gauss_blur = (5,5), 
                 eps_ratio = .0004,
-                num_points = 160,
-                corner_peak_kwargs = { 'distance': 5}, 
-                savgol_kwargs = {'window_length': 7, 'polyorder': 2},
-                lock_peak_kwargs = {'height':60, 'distance':5},
+                num_points = 200,
 
-                lock_n = 10,
-                lock_angle = 200,
-                lock_max_mse = 200,
-                lock_min_s = 1/16,   
+                noise_treshold = 60,
+                savgol_kwargs = {'window_length': 5, 'polyorder': 2},
 
-                line_n = 2,
-                line_max_mse = 10,
+                lock_n_ratio = .5,
+                lock_s_range = [.1, .5], # % part of avg edge length
+                lock_cum_a_range = [180, 300], # lock angular range [deg]
+                lock_max_mse = 350, # circularity crit.
+                lock_edge_max_dca = 45, #[deg]
+                lock_pc_crit = 100,
+
+                line_n_ratio = .05,
+                line_max_mse = 100,
+
+                corner_max_ds = 300,               
+                corner_cum_a_range = [-135, -45],
                ):
 
-    local = os.path.dirname(__file__)
-    path = os.path.join(local, dir)
-    os.chdir(local)
+    if not pieces_dir:
+        pieces_dir = f'pieces_{p_set}'
 
-    filenames = os.listdir(path)
-    filenames.sort()
+    filenames = os.listdir(pieces_dir)
+    filenames.sort()   
+    if files_range:
+        filenames = filenames[files_range[0]-1 : files_range[1]]
 
-    for piece_id, file in enumerate(filenames[:1], start = len(pieces)):
-        file = os.path.join(dir,file)
-        print(file)
-        img = cv.imread(file)
+    print(f"""  
+                Parameters:
+                ----------------------------------
+                gauss_blur = {gauss_blur}
+                eps_ratio = {eps_ratio}
+                num_points = {num_points}
 
-        # Find main piece
-        gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-        blur = cv.GaussianBlur(gray,gauss_blur,0)
-        _,thresh = cv.threshold(blur,0,255,cv.THRESH_BINARY+cv.THRESH_OTSU)    
-        thresh = cv.bitwise_not(thresh)
-        ret, labels = cv.connectedComponents(thresh)
-        connected_areas = [np.count_nonzero(labels == l) for l in range(1, ret)]
-        max_area_idx = np.argmax(connected_areas) + 1
-        gray[labels != max_area_idx] = 0
-        gray[labels == max_area_idx] = 255
-        
-        # Find simplified contour
-        _,thresh = cv.threshold(blur,0,255,cv.THRESH_BINARY+cv.THRESH_OTSU)    
-        thresh = cv.bitwise_not(thresh)    
-        cnts, _ = cv.findContours(thresh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE)
-        largest_cnt = max(cnts, key=cv.contourArea)        
-        epsilon = eps_ratio * cv.arcLength(largest_cnt, True)
-        appx_cnt = cv.approxPolyDP(largest_cnt, epsilon, True)
+                noise_treshold = {noise_treshold}
+                savgol_kwargs = {savgol_kwargs}
 
-        # Convert contour to NumPy format and compute cumulative distances along the curve
-        appx_cnt = np.reshape(appx_cnt, (-1, 2))  # Remove unnecessary dimensions
-        curve = np.vstack([appx_cnt, appx_cnt[0]])  # Close the contour
-        s = np.cumsum(np.sqrt(np.sum(np.diff(curve, axis=0)**2, axis=1)))
-        s = np.insert(s, 0, 0)  # Insert starting point
+                lock_n_ratio = {lock_n_ratio}
+                lock_s_range = {lock_s_range}
+                lock_cum_a_range = {lock_cum_a_range}
+                lock_max_mse = {lock_max_mse}
+                lock_edge_max_dca = {lock_edge_max_dca}
+                lock_pc_crit = {lock_pc_crit}
 
-        # Interpolate points at evenly spaced distances
-        int_cnt = np.zeros((num_points+1, 2), dtype=np.float32)
-        for i, d in enumerate(np.linspace(0, s[-1], num_points+1)):
-            idx = np.searchsorted(s, d)
-            t = (d - s[idx-1]) / (s[idx] - s[idx-1]) if idx > 0 else 0
-            int_cnt[i] = (1 - t) * curve[idx-1] + t * curve[idx]
+                line_n_ratio = {line_n_ratio}
+                line_max_mse = {line_max_mse}
 
-        # Convert back to contour format
-        cnt = int_cnt[:num_points].astype(np.int32)
-        (cnt_x, cnt_y, cnt_w, cnt_h) = cv.boundingRect(cnt.reshape(-1, 1, 2))
-        # Prepare preview
-        preview = cv.cvtColor(gray, cv.COLOR_GRAY2BGR)
-        cv.drawContours(preview, [cnt.reshape(-1, 1, 2)], -1, (0, 255, 0), 3)
+                corner_max_ds = {corner_max_ds}       
+                corner_cum_a_range = {corner_cum_a_range}
+          """)
+    pieces_len = len(filenames)
 
-        # Initialize counts
-        # line_points = 0
-        # non_line_points = 0
-
-        # Compute cumulative distances
-        cnt2 = np.vstack([cnt, cnt])  
-        s2 = np.cumsum(np.sqrt(np.sum(np.diff(cnt2, axis=0)**2, axis=1)))
-        s2 = np.insert(s2, 0, 0)  # Insert starting point
-
-        # Compute angle and line/non-line points ratio
-        a2 = np.zeros(num_points*2)
-        for i in range(1, num_points*2-1):  # Avoid first & last points
-            p1 = cnt2[i - 1]  # Previous point
-            p2 = cnt2[i]      # Current point
-            p3 = cnt2[i + 1]  # Next point
-
-            # Compute vectors
-            v1 = p2 - p1
-            v2 = p3 - p2
-
-            # Compute cosine of angle using dot product
-            dot_product = np.dot(v1, v2)
-            cross_product = np.cross(v1, v2)
-            mag_v1 = np.linalg.norm(v1)
-            mag_v2 = np.linalg.norm(v2)
-
-            if mag_v1 == 0 or mag_v2 == 0:  # Avoid division by zero
-                angle_degrees = 0.0
-            else:
-                cos_angle = dot_product / (mag_v1 * mag_v2)
-                angle = np.arccos(np.clip(cos_angle, -1.0, 1.0)) * np.sign(cross_product)  # Convert to radians
-                angle_degrees = np.degrees(angle)
-            a2[i] = angle_degrees           
-
-        # Find locks
-        cum_a2 = np.cumsum(a2, axis = 0)
-        lock_cnt2 = []
-        lock_cnt2_ = []
-        lock_sca2 = []
-        lock_sca2_ = []
-        locks = []
-        lock_mse2 = np.zeros(num_points*2)
-        
-        i = lock_n - 1
-        for _ in range(lock_n, num_points*2 - lock_n):
-            i += 1
-            lock_s =         s2[i - lock_n : i + lock_n]
-            lock_cum_a = cum_a2[i - lock_n : i + lock_n]
-            id_max = np.argmax(lock_cum_a)
-            id_min = np.argmin(lock_cum_a)
-            i0 = min(id_min, id_max) 
-            i1 = max(id_min, id_max)
-            d_cum_a = lock_cum_a[i1] - lock_cum_a[i0]
-            d_s = lock_s[i1] - lock_s[i0]
-            lock_dir = np.sign(d_cum_a)
-
-            if abs(d_cum_a) > lock_angle and abs(d_s) > s[-1]*lock_min_s:
+    for piece_i, file in enumerate(filenames, start = p_i_start):
+        plot_piece_i = plot_piece
+        piece_id = p_set*p_set_mult + piece_i
+        file = os.path.join(pieces_dir,file)
                 
-                # Limit to peak-peak range
-                lock_s_ =         lock_s[i0:i1]
-                lock_cum_a_ = lock_cum_a[i0:i1]
-                a, b = np.polyfit(lock_s_, lock_cum_a_, 1)  # 1 means linear fit
-                lock_line = a * lock_s_ + b
-                mse = np.mean((lock_cum_a_ - lock_line) ** 2)   
+        cnt2, s2, cum_a2, preview, cnt_rect, cum_a2_raw, ca2_filtered = _get_contour(file, num_points, gauss_blur, eps_ratio, noise_treshold, savgol_kwargs)
+        # cnt_x, cnt_y, cnt_w, cnt_h = cnt_rect
 
-                if mse < lock_max_mse:
+        get_corners = False
+        if piece_i in select_corners:
+            get_corners = True
+
+        for try_i in range(2):
+            corners = None
+            if try_i == 1 or get_corners:
+                cnt2, corners, corners_cnt2, corners_crit = _select_corners(num_points, cnt2, s2, cum_a2)
+                plot_piece_i = True  
+
+            locks, locks_p, locks_sca, locks_crit = _get_locks(num_points, cnt2, s2, cum_a2, 
+                                                            lock_n_ratio, lock_s_range, lock_cum_a_range, 
+                                                            lock_max_mse, lock_edge_max_dca, lock_pc_crit, corners)
+        
+            locks_pc, locks_p0, locks_p12, locks_p34 = locks_p
+            locks_sca_p0, locks_sca_p12, locks_sca_p34 = locks_sca    
+            lines, lines_cnt2, lines_crit  = _get_lines(num_points, cnt2, s2, cum_a2, locks, line_n_ratio, line_max_mse)
+
+            if corners is None:
+                cnt2, corners, corners_cnt2, corners_crit = _get_corners(num_points, cnt2, s2, cum_a2, lines, corner_max_ds, corner_cum_a_range)
             
-                    # Extend lock range
-                    for j0 in range(i0-1, i0 - lock_n, -1):
-                        j = i - lock_n + j0
-                        if cum_a2[j]*lock_dir < cum_a2[j+1]*lock_dir:
-                            i0 = j0
-                        else:
-                            break
+            edges, flat_edges = _get_edges(num_points, cnt2, s2, cum_a2, locks, corners)
 
-                    for j1 in range(i1, i1 + lock_n, 1):   
-                        j = i - lock_n + j1
-                        if cum_a2[j-1]*lock_dir < cum_a2[j]*lock_dir:
-                            i1 = j1
-                        else:
-                            break               
-                    
-                    # Find middle point of lock
-                    i0_ = i - lock_n + i0
-                    i1_ = i - lock_n + i1
-                    i =   int((i0_+i1_)/2)
+            edge_locks = 0
+            for edge in edges:
+                edge_locks += abs(edge['l_dir'])
+            print(f'{piece_i}/{pieces_len} - {file}, flat_edges: {len(flat_edges)}, edge_locks {edge_locks}')
 
-                    lock_cnt2.append(cnt2[i])
-                    lock_cnt2_.append(cnt2[i0_])
-                    lock_cnt2_.append(cnt2[i1_])
-                    lock_sca2.append([s2[i], cum_a2[i]])
-                    lock_sca2_.append([s2[i0_], cum_a2[i0_]])
-                    lock_sca2_.append([s2[i1_], cum_a2[i1_]])
-                    locks.append({'i0':i0_, 'i': i, 'i1':i1_, 'dir': lock_dir})
-                    lock_mse2[i] = mse                    
-
-                # Jump to next lock
-                i += lock_n
-
-            # End loop
-            if i >= num_points*2 - lock_n:
+            # If enough locks, skip manual corners selection
+            if locks_range[0] <= edge_locks <= locks_range[1]:
                 break
 
-        lock_cnt2 =  np.array(lock_cnt2).reshape(-1, 2)
-        lock_cnt2_ = np.array(lock_cnt2_).reshape(-1, 2)
-        lock_sca2 =  np.array(lock_sca2).reshape(-1, 2)
-        lock_sca2_ = np.array(lock_sca2_).reshape(-1, 2)
-       
-        # Find lines - stright parts of edges out of locks
-        line_n = 2
-        line_max_mse = 100
-        line_mse2 = np.zeros(num_points*2)
-        lines = []
-        line_cnt2 = []
-        i = -1
-        for _ in range(line_n, num_points*2 - line_n):
-            i += 1
 
-            # Skip locks
-            for lock in locks:
-                if lock['i0'] <= i+line_n and i-line_n <= lock['i1']:
-                    i = lock['i1'] + line_n
+        piece = {'file': file, 'cnt': cnt2[:num_points], 'edges': edges, 'flat_edges': flat_edges, 'locks_pc': locks_pc[:4-len(flat_edges)], 'corners_cnt': corners_cnt2[:4]}
+        pieces.update({piece_id: piece})
 
-            if i >= num_points*2-line_n-1:
-                break
-            
-            line_cum_a = cum_a2[i-line_n : i+line_n+1]
-            avg_line = np.average(line_cum_a)
-            line_mse = np.mean((line_cum_a - avg_line) ** 2) 
-            line_mse2[i] = line_mse
-            if line_mse < line_max_mse:
-                p1 = np.mean(cnt2[i-line_n : i+1], axis= 0)
-                p2 = np.mean(cnt2[i : i+line_n+1], axis= 0)
-                lines.append({'i': i, 's': s2[i], 'ca': avg_line, 'p1': p1, 'p2': p2})
-
-                # Line points preview
-                for j in range(i-line_n, i+line_n+1):
-                    line_cnt2.append(cnt2[j])
-        line_cnt2 = np.array(line_cnt2).reshape(-1, 2)
-
-        # Find corners
-        corner_min_dca = 60
-        corner_max_ds = 100
-        corners = []
-        corner_cnt2 = []
-        for j in range(len(lines)-1):
-            # Skip non-corners
-            s1_ = lines[j]['s']
-            s2_ = lines[j+1]['s']            
-            ca1_ = lines[j]['ca']
-            ca2_ = lines[j+1]['ca']            
-            if abs(ca2_ - ca1_) < corner_min_dca or (s2_ - s1_) > corner_max_ds:
-                continue
-                
-            i1 = lines[j]['i']
-            i2 = lines[j+1]['i']
-
-            p1 = lines[j]['p1']
-            p2 = lines[j]['p2']
-            p3 = lines[j+1]['p1']
-            p4 = lines[j+1]['p2']
-
-            v1 = p2-p1
-            v2 = p3-p4
-            A, B = p1, p4
-
-            matrix = np.array([v1, -v2]).T  # Coefficients for t1, t2
-            rhs = B - A  # Right-hand side of the equation
-            
-            # Solve for t1, t2 (if determinant is nonzero)
-            t1, t2 = np.linalg.solve(matrix, rhs)
-            corner_cnt = A + t1 * v1  # Compute intersection point
-            corner_cnt2.append(corner_cnt)
-
-            # Correct corner in contour cnt2
-            distances = np.linalg.norm(cnt2[i1:i2] - corner_cnt, axis=1)
-            corner_i = i1 + np.argmin(distances)
-            cnt2[corner_i] = corner_cnt
-            corner = {'i': corner_i, 's': s2[corner_i], 'ca': (ca1_+ca2_)/2}
-            corners.append(corner)
-
-            if len(corners) == 5:
-                break
-        corner_cnt2 = np.array(corner_cnt2).reshape(-1, 2)
-
-        print(corners)
-        print(corner_cnt2)
-
-        # Extract edges
-        edges = []
-        flat_edges = []
-        for edge_id, (c0, c1) in enumerate(zip(corners[:4], corners[1:5])):
-            i0, i1 = c0['i'], c1['i']
-
-            e_cnt = cnt2[i0 : i1][0]
-            e_s = np.array(s2)[i0 : i1] 
-            e_a = np.array(a2)[i0 : i1] 
-            e_s -= np.average(e_s)
-            e_a -= np.average(e_a)
-            e_a_csum = np.cumsum(e_a)
-            e_shape = np.column_stack((e_s, e_a_csum))
-
-            # Assign lock to edge
-            for lock in locks:
-                if i0 <= lock['i'] <= i1:
-                    break
-
-            if lock['dir'] == 0:
-                flat_edges.append(edge_id)
-
-            edges.append({'e_cnt': e_cnt, 'e_shape': e_shape, 'lock': lock})
-
-        # Rotate edges to have 1st non-flat
-        if len(flat_edges):
-            e2 = edges + edges
-            id = max(flat_edges)+1
-            edges = e2[id: id+4]
-
-        piece = {'id': piece_id, 'file': file, 'edges': edges, 'flat_edges': flat_edges}
-        pieces.append(piece)
-
-        if plot_piece:
+        if plot_piece_i:
             # Plot piece
-            fig, axs = plt.subplots(2, 4, figsize=(10, 5))
+            fig, axs = plt.subplots(2, 4, figsize=(12, 6))
+            fig.suptitle(f'Piece {piece_id}, file {file}')
 
             # Plot original points (with duplicates)
             plot_i = -1
@@ -355,282 +591,663 @@ def get_pieces( dir = 'img', pieces = [], plot_piece = True,
 
             plot_i += 1
             axs[0,plot_i].plot(cnt2[:, 0], cnt2[:, 1], color="blue", marker=".")
-            axs[0,plot_i].scatter(lock_cnt2[:, 0],  lock_cnt2[:, 1],  color="red", marker="x")
-            axs[0,plot_i].scatter(lock_cnt2_[:, 0], lock_cnt2_[:, 1], color="green", marker="o")
-            # axs[0,plot_i].scatter(line_cnt2[:, 0], line_cnt2[:, 1], color="green", marker="x")
-            axs[0,plot_i].scatter(corner_cnt2[:, 0], corner_cnt2[:, 1], color="red", marker="x")
+            axs[0,plot_i].scatter(locks_pc[:, 0],  locks_pc[:, 1],  color="red", marker="+")
+
+            for corner_i, corner_cnt in enumerate(corners_cnt2):  
+                if corner_i < 5:                  
+                    axs[0,plot_i].text(corner_cnt[0]+corner_i*10, corner_cnt[1]+corner_i*10, str(corner_i), fontsize=8, color="red")
+
+            axs[0,plot_i].scatter(locks_p0[:, 0],  locks_p0[:, 1],  color="red", marker="o")
+            axs[0,plot_i].scatter(locks_p12[:, 0], locks_p12[:, 1], color="pink", marker="o")
+            axs[0,plot_i].scatter(locks_p34[:, 0], locks_p34[:, 1], color="green", marker="o")
+            axs[0,plot_i].scatter(corners_cnt2[:, 0], corners_cnt2[:, 1], color="red", marker="x")
+            axs[0,plot_i].scatter(lines_cnt2[:, 0], lines_cnt2[:, 1], color="orange", marker="+", s=100)
             axs[0,plot_i].set_title("contour")
 
             plot_i += 1
-            axs[0,plot_i].plot(s2, cum_a2, color="blue", marker=".") # 
-            axs[0,plot_i].scatter(lock_sca2[:, 0],  lock_sca2[:, 1],  color="red", marker="x")
-            axs[0,plot_i].scatter(lock_sca2_[:, 0], lock_sca2_[:, 1], color="green", marker="o", s=50)
-            axs[0,plot_i].set_title("cum_a2")
+            axs[0,plot_i].plot(s2,cum_a2_raw, color="lightgray", marker=".") 
+            axs[0,plot_i].plot(s2,ca2_filtered, color="lightblue", marker=".") 
+            axs[0,plot_i].plot(s2,cum_a2, color="blue") 
+            axs[0,plot_i].scatter(locks_sca_p0[:, 0], locks_sca_p0[:, 1],  color="red", marker="o", s=50)   #  
+            axs[0,plot_i].scatter(locks_sca_p12[:, 0],locks_sca_p12[:, 1], color="pink", marker="o", s=50) # 
+            axs[0,plot_i].scatter(locks_sca_p34[:, 0],locks_sca_p34[:, 1], color="green", marker="o", s=50) # 
+            axs[0,plot_i].scatter(lines_crit[:, 0],   lines_crit[:, -1],   color="orange", marker="+", s=100)
+
+            if corners_crit:
+                axs[0,plot_i].scatter(corners_crit[:, 0], corners_crit[:, -1], color="red", marker="x", s=100)
+            axs[0,plot_i].set_title("locks")
 
             plot_i += 1
-            axs[0,plot_i].plot([l['s'] for l in lines],      [l['ca'] for l in lines],   color="blue", marker=".")
-            axs[0,plot_i].scatter([c['s'] for c in corners], [c['ca'] for c in corners], color="red",  marker="x")
-            axs[0,plot_i].set_title("lines corners")
+            axs[0,plot_i].scatter(locks_crit[:, 0],  locks_crit[:, 1],  color="blue",  label='ds')   #  
+            axs[0,plot_i].scatter(locks_crit[:, 0],  locks_crit[:, 2],  color="red",   label='dcuma' )   #  
+            axs[0,plot_i].scatter(locks_crit[:, 0],  locks_crit[:, 3],  color="green", label='mse' )   #  
+            axs[0,plot_i].set_title("locks crit (ds, dca, mse)")
+            axs[0,plot_i].set_ylim(0,1)
+            axs[0,plot_i].legend()
 
-            # plot_i += 1
-            # axs[0,plot_i].plot(s2, line_mse2, color="blue", marker=".")
-            # axs[0,plot_i].set_title("line_mse2")
+            plot_i += 1 
+            axs[0,plot_i].scatter(lines_crit[:, 0],   lines_crit[:, 1],   color="lightblue", label='l_mser')
+            if corners_crit:
+                axs[0,plot_i].scatter(corners_crit[:, 0], corners_crit[:, 1], color="red",   label='c_ds')
+                axs[0,plot_i].scatter(corners_crit[:, 0], corners_crit[:, 2], color="green", label='c_dcuma')
+                axs[0,plot_i].scatter(corners_crit[:, 0], corners_crit[:, 3], color="blue", label='c_mser')
+            axs[0,plot_i].set_title("line crit (l_mse, c_ds, c_dcuma, c_mser)")
+            axs[0,plot_i].legend()
 
-            # plot_i += 1
-            # axs[0,plot_i].plot(s2, lock_mse2, color="blue", marker=".")
-            # axs[0,plot_i].set_title("lock_mse2")
-
-
-            for i, edge in enumerate(edges):
+            for plot_i, edge in enumerate(edges):
+                lock_dir = edge['l_dir']
                 color = 'gray'
-                if edge['lock'] == 1:
+                if lock_dir == 1:
                     color = 'red'
-                elif edge['lock'] == -1:
+                elif lock_dir == -1:
                     color = 'blue'
-                axs[1,i].plot(edge['e_shape'][0], edge['e_shape'][1], color=color)
+                axs[1,plot_i].plot(edge['e_cnt'][:, 0], edge['e_cnt'][:, 1], color=color)
+                axs[1,plot_i].set_title(f"edge {plot_i} {lock_dir}")
             
             # Show the plots
             plt.show()
     
-    with open("pieces.pkl", "wb") as f:
+    # Write pieces to file
+    if not pieces_file:
+        pieces_file = f'pieces_{p_set}.pkl'
+    
+    with open(pieces_file, "wb") as f:
         pickle.dump(pieces, f)
 
     return pieces
 
-def init_puzzle(rows = M, cols = N, p_file = '', p_id = 0, p_row = 0, p_col = 0):
+def load_pieces( pieces = {}, pieces_file = None, p_set = 0, plot_pieces = True, x_sign = 1, y_sign = 1):
 
-    puzzle = np.empty((rows, cols, 2), dtype=int)
+    if not pieces_file:
+        pieces_file = f'pieces_{p_set}.pkl'
 
-    with open("pieces.pkl", "rb") as f:
-        pieces = pickle.load(f)
+    # Read pieces from file
+    if not os.path.isfile(pieces_file):
+        raise ValueError(f'Pieces file {pieces_file} not found')
     
-    if not p_id and p_file:
-        for piece in pieces:
-            if piece['file'] == p_file:
-                p_id = piece['id']
-    # Set initial edge of 1st corner                
-    e_id = 0
+    with open(pieces_file, "rb") as f:
+        new_pieces = pickle.load(f)   
 
-    # Write puzzle
-    puzzle[p_row, p_col, 0] = p_id
-    puzzle[p_row, p_col, 1] = e_id
+    print(f'Loaded {len(new_pieces)} pieces from {pieces_file}')
+    pieces.update(new_pieces)
+
+    if plot_pieces:
+        n = 10
+        m = math.ceil(len(pieces) / n)
+        m = max(2,m)
+        fig, axs = plt.subplots(m, n) # figsize = plots_shape 
+        fig.suptitle(f'File {pieces_file}')
+        r, c = 0, -1
+
+        for p_id, piece in pieces.items():
+            
+            c += 1
+            if c == n:
+                r += 1
+                c = 0
+            if r == m:
+                break
+
+            cnt = piece['cnt']
+            cnt2 = np.vstack([cnt, cnt]) 
+            locks_pc = piece['locks_pc']                        
+            corners_cnt = piece['corners_cnt']   
+            file = piece['file'] 
+
+            for edge in piece['edges']:  
+                i1, i2 = edge['cnt2_range']
+                if edge['l_dir'] > 0:
+                    color = 'red'
+                elif edge['l_dir'] < 0:
+                    color = 'blue'
+                else:
+                    color = 'gray'
+                axs[r,c].plot(   x_sign*cnt2[i1:i2+1,0], y_sign*cnt2[i1:i2+1,1], color=color)
+
+            axs[r,c].scatter(x_sign*locks_pc[:,0],    y_sign*locks_pc[:,1],    color='red', marker='+')
+            axs[r,c].scatter(x_sign*corners_cnt[:,0], y_sign*corners_cnt[:,1], color='red', marker='x')
+            axs[r,c].set_title(f'{p_id}, {file[-10:-4]}', pad=0)
+
+            axs[r,c].set_xticks([])  # Remove x-axis ticks
+            axs[r,c].set_yticks([])  # Remove y-axis ticks
+            axs[r,c].set_xticklabels([])  # Remove x-axis labels
+            axs[r,c].set_yticklabels([])  # Remove y-axis labels            
+        plt.show()       
+
+    return pieces
+
+def init_puzzle(puzzle = (2, 2), pieces = [], p_file = None, p_id = None, p_pos = (1, 1), p_edge = 1):
+    """init puzzle
+
+    Args:
+        puzzle (tuple, optional): size tuple or puzzle array. Defaults to (M, N).
+        pieces (list, optional): list of pieces. Defaults to [].
+        p_file (_type_, optional): initial piece file. Defaults to None.
+        p_id (_type_, optional): initial piece id. Defaults to None.
+        p_pos (tuple, optional): initial piece position (starting from (1,1)). Defaults to (1, 1).
+        p_edge (int, optional): initial piece edge id (starting from 1). Defaults to 1.
+
+    Returns:
+        _type_: _description_
+    """
+    if type(puzzle) == tuple:
+        puzzle = -np.ones((puzzle[0], puzzle[1]), dtype=float)
+    
+    piece_found = False
+    if not p_id and p_file:
+        for p_id, piece in pieces.items():
+            if p_file in piece['file']:
+                piece_found = True
+                break
+    
+    if not piece_found:
+        raise ValueError(f'Piece {p_file} not found')
+    
+    # Set initial piece
+    piece_id = p_id + p_edge/10
+    puzzle[p_pos[0]-1, p_pos[1]-1] = piece_id
+    print(f'Initial piece {piece_id}')
 
     with open("puzzle.pkl", "wb") as f:
         pickle.dump(puzzle, f)
 
-def match_frame():
-    match_puzzle(col1 = 0, match_dir = 'TB:LR')
-    match_puzzle(row0 = M, match_dir = 'TB:LR')
-    match_puzzle(col0 = N, match_dir = 'BT:LR')
-    match_puzzle(row1 = 0, match_dir = 'BT:LR')
+    write_puzzle(puzzle)
 
-def match_puzzle(row0 = 0, row1 = None, col0 = 0, col1 = None, match_dir = 'TB:LR', dist_crit = 1e3, confirm = True):
+    return puzzle
+
+def match_frame(puzzle, pieces):
+
+    puzzle = match_puzzle(puzzle, pieces, from_pos = (1,1), to_pos = (M,1))
+    puzzle = match_puzzle(puzzle, pieces, from_pos = (M,1), to_pos = (M,N))
+    puzzle = match_puzzle(puzzle, pieces, from_pos = (M,N), to_pos = (1,N))
+    puzzle = match_puzzle(puzzle, pieces, from_pos = (1,N), to_pos = (1,1))
+
+    return puzzle
+
+def _get_candidates(puzzle, pieces, row, col, req_piece_type,
+                    e1_off, e2_off,_e1_off,_e2_off,p1_off,p2_off,
+                    lock_pc_crit = .2,
+                    edge_len_crit = .2,
+                    edge_dist_crit = 1000.,
+                    candidates_diff_crit = 10,
+                    c_per_page = 10,
+                    p_id_offset = 0, page = 0, ratio = 1, 
+                    plot_candidates = True, verbose = True):
+    
+    # Skip first or matched piece
+    piece_id = puzzle[row, col] 
+    if piece_id >= 0:
+        if verbose:
+            print(f'Skip piece {piece_id} already matched')
+        return None, 'p'            
+
+    # Get verticaly reference piece - p1
+    r1, c1 = row + p1_off[0], col + p1_off[1]
+    p1_id, e1_id = _get_p_e(puzzle, r1, c1)
+
+    # Get horizontaly reference piece - p2
+    r2, c2 = row + p2_off[0], col + p2_off[1]
+    p2_id, e2_id = _get_p_e(puzzle, r2, c2)
+    
+    print(f'\nProcessing piece ({row+1},{col+1})')
+    
+    e1_len, e1_cnt_inv, e1_linestr, l1_dir, l1_pc_inv = None, None, None, None, None
+    if p1_id is not None:
+
+        # Get opposite edge to matched previously in top-bottom or bottom-top match
+        e1_id = _offset_edge(e1_id, e1_off)
+
+        print(f'Vertically adjacent piece ({r1+1}, {c1+1}) {p1_id}.{e1_id+1}')
+        piece1 = pieces[p1_id]
+        edge1 = piece1['edges'][e1_id]
+        l1_dir = edge1.get('l_dir')
+        l1_pc = edge1.get('l_pc')
+        e1_cnt = edge1['e_cnt']
+        e1_len = edge1['e_len']
+
+        e1_cnt_inv = np.column_stack((e1_len - e1_cnt[:,0], -e1_cnt[:,1]))[::-1]
+        e1_linestr = LineString(e1_cnt_inv)
+
+        if l1_pc is not None:
+            l1_pc_inv = [e1_len - l1_pc[0], -l1_pc[1]]                           
+        
+    e2_len, e2_cnt_inv, e2_linestr, l2_dir, l2_pc_inv = None, None, None, None, None
+    if p2_id is not None:
+
+        # Get opposite edge to matched previously in horizontal match
+        e2_id = _offset_edge(e2_id, e2_off)
+
+        print(f'Horizontally adjacent piece ({r2+1}, {c2+1}) {p2_id}.{e2_id+1}')
+
+        piece2 = pieces[p2_id]
+        edge2 = piece2['edges'][e2_id]
+        e2_cnt = edge2['e_cnt']
+        e2_len = edge2['e_len']
+        l2_dir = edge2['l_dir']
+        l2_pc = edge2['l_pc']
+
+        e2_cnt_inv = np.column_stack((e2_len - e2_cnt[:,0], -e2_cnt[:,1]))[::-1]
+        e2_linestr = LineString(e2_cnt_inv)
+
+        if l2_pc is not None:
+            l2_pc_inv = [e2_cnt[-1,0] - l2_pc[0], -l2_pc[1]]
+
+    # Check all available pieces
+    candidates = []
+    for _p_id, _piece in pieces.items():
+        
+        file = _piece['file']                
+
+        # Skip pieces already used
+        if np.isin(puzzle, [_p_id+.1, _p_id+.2, _p_id+.3, _p_id+.4]).any():
+            if verbose==2:
+                print(f'Skip piece {_p_id} - already used')
+            continue
+        
+        # Try all edges of _piece - _e1_id is a TOP edge of _piece
+        for _e_id in range(4):     
+
+            piece_id = _p_id + (_e_id+1)/10  
+
+            _edges = _piece['edges']
+
+            # Get 1st edge to match verticaly
+            _e1_id = _offset_edge(_e_id, _e1_off)                    
+            _edge1 = _edges[_e1_id]
+            _e1_cnt = _edge1['e_cnt']
+            _l1_dir = _edge1['l_dir']
+            _l1_pc = _edge1['l_pc']
+
+            # Get 2nd edge to match horizontaly
+            _e2_id = _offset_edge(_e_id, _e2_off)                                                   
+            _edge2 =  _edges[_e2_id]
+            _e2_cnt = _edge2['e_cnt']    
+            _l2_dir = _edge2['l_dir']     
+            _l2_pc =  _edge2['l_pc']   
+
+            _e1_len = np.linalg.norm(_e1_cnt[-1]-_e1_cnt[0])
+            _e2_len = np.linalg.norm(_e2_cnt[-1]-_e2_cnt[0])
+
+            # Skip piece with wrong number of flat edges
+            piece_type = len(_piece['flat_edges'])
+            if piece_type != req_piece_type[row, col]:
+                if verbose:
+                    print(f'Skip piece {piece_id} with wrong number of flat edges ({piece_type} != {req_piece_type[row, col]})')
+                break
+
+            # Skip not flat horiz. external edge
+            if (col == 0 or col == N-1):
+                
+                if col == 0:
+                    _e3_id = _offset_edge(_e_id, 1)
+                if col == N-1:
+                    _e3_id = _offset_edge(_e_id, -1)
+
+                _edge3 = _piece['edges'][_e3_id]
+                _l3_dir = _edge3['l_dir']  
+
+                if _l3_dir != 0:
+                    if verbose:
+                        print(f'Skip edge {piece_id} with not flat external edge {_e3_id+1}')
+                    continue                    
+            
+            # Skip not flat vert. external edge
+            if (row == 0 or row == M-1):
+                
+                if row == 0:
+                    _e3_id = _offset_edge(_e_id, 0)
+                if row == M-1:
+                    _e3_id = _offset_edge(_e_id, 2)
+
+                _edge3 = _piece['edges'][_e3_id]
+                _l3_dir = _edge3['l_dir']  
+
+                if _l3_dir != 0:
+                    if verbose:
+                        print(f'Skip edge {piece_id} with not flat external edge {_e3_id+1}')
+                    continue
+
+
+            # Skip not-matching lock directions on edges
+            if _l1_dir and l1_dir and _l1_dir != -l1_dir:
+                if verbose:
+                    print(f'Skip edge {piece_id} - not-matching vertically')
+                continue
+
+            if _l2_dir and l2_dir and _l2_dir != -l2_dir:
+                if verbose:
+                    print(f'Skip edge {piece_id} - not-matching horizontally')
+                continue
+
+
+            # Skip edges with not matching length
+            if type(edge_len_crit) is float:
+                e1_len_dist = 0
+                if e1_len and _e1_len:
+                    e1_len_dist = np.abs(_e1_len - e1_len)/(e1_len*edge_len_crit)
+
+                e2_len_dist = 0
+                if e2_len and _e2_len:
+                    e2_len_dist = np.abs(_e2_len - e2_len)/(e2_len*edge_len_crit)
+
+                if e1_len_dist > 1 or e2_len_dist > 1:
+                    if verbose:
+                        print(f'Skip edge {piece_id} with not matching edge length', round(e1_len_dist,2), round(e2_len_dist,2))
+                    continue
+
+            # Skip pieces with not matching lock center
+            l1_pc_dist, l2_pc_dist = 0, 0
+            if type(lock_pc_crit) is float:
+                l1_pc_dist = 0
+                if _l1_pc is not None and l1_pc_inv is not None and e1_len:
+                    l1_pc_dist = np.linalg.norm(_l1_pc - l1_pc_inv)/(e1_len*lock_pc_crit) 
+                    
+                l2_pc_dist = 0
+                if _l2_pc is not None and l2_pc_inv is not None and e2_len:
+                    l2_pc_dist = np.linalg.norm(_l2_pc-l2_pc_inv)/(e2_len*lock_pc_crit)
+
+                if l1_pc_dist > 1 or l2_pc_dist > 1:
+                    if verbose:
+                        print(f'Skip edge {piece_id} with not matching lock center', round(l1_pc_dist,2), round(l2_pc_dist,2))
+                    continue
+
+            # Skip pieces with not matching edges angle
+            # if type(edge_angle_crit) is float and row != row0 and col != col0:
+
+            #     p0 = puzzle_corners[row, col]
+            #     p1 = puzzle_corners[row, col+d_c]
+            #     p2 = puzzle_corners[row+d_r, col]
+
+            #     v1 = p1 - p0
+            #     v2 = p2 - p0          
+            #     e12_angle = abs(_get_angle(v1, v2))
+
+            #     _e1_p1 = _edge1['p1']
+            #     _e1_p2 = _edge1['p2']
+            #     _e2_p1 = _edge2['p1']
+            #     _e2_p2 = _edge2['p2']
+
+            #     _v1 = _e1_p2 - _e1_p1  
+            #     _v2 = _e2_p2 - _e2_p1          
+            #     _e12_angle = _get_angle(_v1, _v2)
+
+            #     if e12_angle > 0 and np.abs(_e12_angle - e12_angle)/(e12_angle*edge_angle_crit) > 1:
+            #         if verbose:
+            #             print(f'Skip piece {piece_id} with not matching edge angle', round(_e12_angle,2), round(e12_angle,2))
+            #         continue
+                
+            # Measure how firmly pieces match to each other
+            e1_dist, e2_dist = 0, 0
+            if type(edge_dist_crit) == float:
+                
+                if e1_linestr:
+                    _e1_dist = [Point(p).distance(e1_linestr) for p in _e1_cnt]                    
+                    e1_dist = np.sum(_e1_dist) / edge_dist_crit
+            
+                if e2_linestr:
+                    _e2_dist = [Point(p).distance(e2_linestr) for p in _e2_cnt]                    
+                    e2_dist = np.sum(_e2_dist) / edge_dist_crit
+                
+                if e1_dist > 1 or e2_dist > 1:
+                    if verbose:
+                        print(f'Skip edge {piece_id} above edge_dist_crit', e1_dist, e2_dist)
+                    continue
+
+            # Append candidate                    
+            total_dist = (e1_dist**2 + e2_dist**2)**.5
+            candidate = {'p_id': _p_id, 'e_id': _e_id, 'p_file': _piece['file'], 'edges': _edges,
+                        'dist': total_dist, 'dist_crit': np.array([l1_pc_dist, e1_dist, l2_pc_dist, e2_dist]).round(2),
+                        }
+            candidates.append(candidate)
+                                
+    if len(candidates) == 0:
+        print(f'No candidates found for ({row+1},{col+1})')  
+        inp = input(f'Enter p to skip piece, c to skip col., + to get more candidates, q quit', ).strip()
+        return None, inp
+    
+    # Sort candidates            
+    candidates = sorted(candidates, key=lambda c: c["dist"]) 
+
+    candidates = candidates[:c_per_page*int(1+(ratio-1)*4)]
+
+    # List all candidates
+    print(f'For loc ({row+1},{col+1}) (p1 {p1_id}.{e1_id}) found {len(candidates)} candidates (page {page}, ratio {ratio}):')
+    
+    recommended = ''
+    if len(candidates) > 1:
+        c0_dist = candidates[0]['dist']
+        c1_dist = candidates[1]['dist']
+
+        if c0_dist > 0 and (c1_dist - c0_dist)/c0_dist < candidates_diff_crit:
+            recommended = ' - RECOMMENDED'
+    
+    for c, candidate in enumerate(candidates):
+        p_id = candidate['p_id']
+        e_id = candidate['e_id']      
+        file = candidate['p_file']
+        dist_crit = candidate['dist_crit']
+
+        # if 2 first pieces have sufficiently big difference in dist_crit, 1st is recommended
+        print(f'({c}) - {p_id+p_id_offset}.{e_id+1}, file={file}, dist_crit={dist_crit}{recommended}')
+        recommended = ''
+
+    # Plot page by page
+    if plot_candidates:
+        pages = math.ceil(len(candidates)/c_per_page)
+        for page in range(pages):
+
+            _candidates = candidates[page*c_per_page : ]      
+            candidates_num = min(c_per_page, len(_candidates))
+            _candidates = _candidates[ : candidates_num]
+
+            fig, axs = plt.subplots(3, max(candidates_num,2), figsize=(10, 5))                
+            for c, candidate in enumerate(_candidates):
+
+                _p_id = candidate['p_id']
+                _e_id = candidate['e_id']
+                _piece = pieces[_p_id]
+                _cnt = _piece['cnt']
+
+                # Get candidte edge to match verticaly
+                _e1_id = _offset_edge(_e_id, _e1_off)
+                _edge1 = pieces[_p_id]['edges'][_e1_id]
+                _e1_cnt = _edge1['e_cnt']
+                _l1_dir = _edge1['l_dir']
+                _l1_pc =  _edge1['l_pc']
+
+                # Get candidte edge to match horizontaly
+                _e2_id = _offset_edge(_e_id, _e2_off)
+                _edge2 = pieces[_p_id]['edges'][_e2_id]
+                _e2_cnt = _edge2['e_cnt']
+                _l2_dir = _edge2['l_dir']
+                _l2_pc =  _edge2['l_pc'] 
+
+                if e1_cnt_inv is not None:
+                    axs[0,c].plot(e1_cnt_inv[:,0], e1_cnt_inv[:,1], color='blue')
+                if l1_pc_inv is not None:
+                    axs[0,c].scatter(l1_pc_inv[0], l1_pc_inv[1], color='blue', marker='+')
+                if _e1_cnt is not None: # isinstance(_e1_cnt, np.ndarray) and _e1_cnt.ndim == 2 :
+                    axs[0,c].plot(_e1_cnt[:,0], _e1_cnt[:,1], color='red')
+                if _l1_pc is not None: # isinstance(_l1_pc, np.ndarray) and _l1_pc.ndim == 2:
+                    axs[0,c].scatter(_l1_pc[0], _l1_pc[1], color='red', marker='+')
+                    axs[0,c].set_title(f'{_p_id+p_id_offset}.{_e_id+1}')
+                    axs[0,c].axis('equal')
+
+                if e2_cnt_inv is not None:
+                    axs[1,c].plot(e2_cnt_inv[:, 0], e2_cnt_inv[:, 1], color="blue")
+                if l2_pc_inv is not None:
+                    axs[1,c].scatter(l2_pc_inv[0], l2_pc_inv[1], color='blue', marker='+')
+                if _e2_cnt is not None: # isinstance(_e2_cnt, np.ndarray) and _e2_cnt.ndim == 2:
+                    axs[1,c].plot(_e2_cnt[:,0], _e2_cnt[:,1], color='red')
+                if _l2_pc is not None: # isinstance(_l2_pc, np.ndarray) and _l2_pc.ndim == 2:
+                    axs[1,c].scatter(_l2_pc[0], _l2_pc[1], color='red', marker='+')
+                    axs[1,c].set_title(f'{_p_id+p_id_offset}.{_e_id+1}')
+                    axs[1,c].axis('equal')
+
+                axs[2,c].plot(_cnt[:,0], _cnt[:,1], color='blue')
+
+            fig.suptitle(f'page {page}, loc ({row+1},{col+1}), p1 {p1_id}.{e1_id}, p2 {p2_id}.{e2_id}')
+            plt.show()
+
+    return candidates, None
+
+def match_puzzle(puzzle, pieces, from_pos = (2,1), to_pos = (3,1), 
+                 lock_pc_crit = .2,
+                 edge_len_crit = .2,
+                 edge_dist_crit = 1000.,
+
+                 candidates_diff_crit = 10,
+                 p_id_offset = 0, 
+                 plot_candidates = True, verbose = True
+                 ):
     """
-    Default orientation of corner piece
-        3
-        -----
-        |     |
-    0  >     | 2
-        |     |
-        --^--
-        1
+        Default orientation of corner piece
+            4
+            -----
+            |     |
+        1   >     | 3
+            |     |
+            --^--
+            2
 
-    Default orientation of border piece
-        3
-        -----
-        |     |
-    0  >     < 2
-        |     |
-        --^--
-        1      
+        Default orientation of border piece
+            4
+            -----
+            |     |
+        1  >     < 3
+            |     |
+            --^--
+            2      
+
+        Piece _p is checked if matches on e1 to p1, then on e2 to p2 (not if in 1st column)
+
+        p   |  p   |  p1 
+            |      |
+                    --e1--
+            |      |  
+        p   |  p2 e2  _p
+            |      |
+
+        Reqired flat edges
+
+        2 1 1 .. 1 1 2
+        1 0 0 .. 0 0 1
+        ..
+        1 0 0 .. 0 0 1
+        2 1 1 .. 1 1 2
+
     """
-    # Read puzzle
-    with open("puzzle.pkl", "rb") as f:
-        puzzle = pickle.load(f)
+    M, N = puzzle.shape
+    # puzzle_corners = np.zeros((M+1, N+1, 2), dtype=float)
 
+    # Use rows and cols starting from 0
+    row0, col0 = from_pos
+    row1, col1 = to_pos
+    row0, col0, row1, col1 = row0-1, col0-1, row1-1, col1-1
 
-    if match_dir == 'TB:LR' or 'BT:RL':
-        dedge = +1
-    else:
-        dedge = -1
+    d_r = +1 if row1 >= row0 else -1
+    d_c = +1 if col1 >= col0 else -1
 
-    dir = match_dir.split(':')
+    # Set offset of adjacent horizontal edge
+    e1_off = 2 if d_r == 1 else 0
+    e2_off = -d_c
 
-    with open("pieces.pkl", "rb") as f:
-        pieces = pickle.load(f)
+    _e1_off = 2 if d_r == -1 else 0  
+    _e2_off = d_c
 
-    if row1 is None:
-        row1 = puzzle.shape[0]
+    # Set rows and cols
+    rows = range(row0, row1 + d_r, d_r)
+    p1_off = (-d_r, 0)
 
-    if col1 is None:
-        col1 = puzzle.shape[1]
+    cols = range(col0, col1 + d_c, d_c)
+    p2_off = (0,-d_c)
 
+    # required number of flat edges
+    req_piece_type = np.zeros((M, N), dtype=int)
+    req_piece_type[ 0, :] = 1
+    req_piece_type[-1, :] = 1
+    req_piece_type[ :, 0] = 1
+    req_piece_type[ :,-1] = 1
+    req_piece_type[ 0, 0] = 2
+    req_piece_type[ 0,-1] = 2
+    req_piece_type[-1,-1] = 2
+    req_piece_type[-1, 0] = 2    
 
-    if dir[0] == 'TB':
-        row00 = row0
-        rows = range(row0, row1+1)
-        p1_off = (-1, 0)
-    else:
-        row00 = row1
-        rows = range(row1, row0-1, -1)
-        p1_off = (+1, 0)
-
-    if dir[1] == 'LR':
-        col00 = col0
-        cols = range(col0, col1)
-        p2_off = (0,-1)
-    else:
-        col00 = col1
-        cols = range(col1, col0-1, -1)
-        p2_off = (0,+1)
-       
+    print(f'Start from piece {from_pos} to {to_pos}')
 
     for col in cols:
         for row in rows:
-            
-            # Skip initial piece
-            if col == col00 and row == row00:
-                continue
-            
-            # Get upper/lower reference piece - p1
-            r,c = row + p1_off[0], col + p1_off[1]
-            p1_id = puzzle[r, c, 0]
 
-            if not p1_id:
-                raise ValueError(f'Empty reference piece (row {r}, col {c})')
-            
-            e1_id = puzzle[r, c, 1]
+            for ratio in [1., 1.25, 1.5]:
 
-            # Get opposite edge to matched previously in top-bottom or bottom-top match
-            if not (r == row00 and c == col00):
-                e1_id = e1_id+2 if e1_id+2 < 4 else e1_id-2
+                candidates, inp = _get_candidates(puzzle, pieces, row, col, req_piece_type,
+                                            e1_off, e2_off,_e1_off,_e2_off,p1_off,p2_off,
 
-            edge = pieces[p1_id]['edges'][e1_id]
-            lock1 = edge['lock']
-            eSA1 = edge['e_SA']
+                                            lock_pc_crit = lock_pc_crit*ratio,
+                                            edge_len_crit = edge_len_crit*ratio,
+                                            edge_dist_crit = edge_dist_crit*ratio,
 
-            # Skip internal pieces if frame evaluated
-            if (col == 0 or col == puzzle.shape[1]-1) and len(piece['flat_edges']) == 0:
-                continue
-            
-            # Get left/right reference piece - p2
-            p2_id, e2_id = None, None
-            lock2, eSA2 = None, None
-            r,c = row + p2_off[0], col + p2_off[1]
-            if (col > col00 and dir[1] == 'LR') or (col < col00 and dir[1] == 'RL'):
-                p2_id = puzzle[r, c, 0]
+                                            candidates_diff_crit = candidates_diff_crit, 
+                                            p_id_offset = p_id_offset, ratio = ratio,
+                                            plot_candidates = plot_candidates, verbose = verbose)        
                 
-                if p2_id:
-                    # Get opposite edge to matched previously in left-right or right-left match
-                    e2_id = puzzle[r, c, 1]
-                    if dir[1] == 'LR':
-                        e2_id = e2_id+1 if e2_id+1 < 4 else e2_id-3
+                c_id = None
+                if isinstance(candidates, list) and inp is None:
+                    inp = input(f'Input candidate id (0 default, p to skip piece, c to skip col., + to get more candidates, q quit)', ).strip()
+                    if inp.isnumeric():
+                        c_id = int(inp)
                     else:
-                        e2_id = e2_id+3 if e2_id+3 < 4 else e2_id-1
+                        c_id = 0
 
-                    edge = pieces[p2_id]['edges'][e2_id]
-                    lock2 = edge['lock']
-                    eSA2 = edge['e_SA']
-
-            # Check all available pieces
-            candidates = []
-            for piece in pieces:
-                p_id = piece['id']
-                
-                # Skip pieces already used
-                if p_id in puzzle[:,:,0]:
+                if inp == '+':
                     continue
-                
-                # Try to match all edges with lock1/lock2
-                for e_id in range(4):
-
-                    # Get first edge to match with p2/e2
-                    edge = pieces[p_id]['edges'][e_id]
-                    lock = edge['lock']
-                    e_SA = edge['e_SA']
-                    eSA_inv = np.column_stack((e_SA[::-1,0], -e_SA[::-1,1]))
-                    dist1, _ = fastdtw(eSA1, eSA_inv, dist=euclidean)
-
-                    # Skip flat or not-matching edges
-                    if lock == 0 or lock == lock1:
-                        continue
-                    
-                    # Get adjacent edge to match with p2/e2
-                    if lock2:
-                        e_adj = e_id+dedge
-                        if e_adj > 3:
-                            e_adj -= 4
-                        edge_adj = pieces[p_id]['edges'][e_adj]
-                        lock_adj = edge['lock']                    
-
-                        # Skip flat or not-matching edges
-                        if lock_adj == 0 or lock_adj == lock2:
-                            continue
- 
-                        e_SA = edge_adj['e_SA']
-                        eSA_inv = np.column_stack((e_SA[::-1,0], -e_SA[::-1,1]))                        
-                        dist2, _ = fastdtw(eSA2, eSA_inv, dist=euclidean)
-                    else:
-                        dist2 = 0
-                    
-                    # Measure how firmly pieces match to each other
-                    dist = (dist1**2 + dist2**2)**.5
-
-                    # Append potential candidate
-                    if dist < dist_crit:
-                        candidate = {'p_id': p_id, 'e_id': e_id, 'dist': dist}
-                        candidates.append(candidate)
-            
-            # Sort candidates
-            candidates = sorted(candidates, key=lambda c: c["dist"])
-            
-            # Plot candidates
-            max_cand = min(4, len(candidates))
-            fig, axs = plt.subplots(1, max_cand, figsize=(5, 5))
-            for c, candidate in enumerate(candidates):
-                print(candidate)
-
-                p_id = candidate['p_id']
-                e_id = candidate['e_id']
-                e_cnt = pieces[p_id]['edges'][e_id]['e_cnt']
-
-                for e_id_ in range(4):
-                    color='gray'
-                    if e_id == e_id_:
-                        color = 'green'
-                    axs[1,c].plot(e_cnt[:,0], e_cnt[:,1], color=color)
-                axs[1,c].set_title(f'{p_id}:{e_id}')
-            plt.show()
-
-            c_id = 0
-            p_id = candidates[c_id]['p_id']
-            e_id = candidates[c_id]['e_id']
-
-            # Ask user to confirm final choice of candidate
-            if confirm:
-                c_id = int(input(f'Input candidate id (0 - {p_id}:{e_id})', ).strip() or -1)
-                if 0 >= c_id < len(candidates):
-                    p1_id = candidates[c_id]['p_id']
-                    e1_id = candidates[c_id]['e_id'] 
                 else:
-                    raise IndexError(f'Candidate id out of range')
+                    break
+
+            # Skip piece
+            if inp == 'p':
+                continue
+
+            # Skip column
+            elif inp == 'c':
+                break
+            
+            # Quit
+            elif inp == 'q':
+                exit()
+
+
+            if 0 <= c_id < len(candidates):
+                p_id = candidates[c_id]['p_id']
+                e_id = candidates[c_id]['e_id'] 
+            else:
+                raise IndexError(f'Candidate id out of range')                        
 
             # Save matched piece
-            puzzle[row, col, 0] = p_id
-            puzzle[row, col, 1] = e_id
-
-    with open("puzzle.pkl", "wb") as f:
-        pickle.dump(puzzle, f)
-
-    print(puzzle[:,:,1])
+            piece_id = p_id + (e_id+1)/10
+            puzzle[row, col] = piece_id
+            write_puzzle(puzzle)   
+            print(f'Set piece {piece_id+p_id_offset} in ({row+1},{col+1})')
 
     return puzzle      
 
+def read_puzzle():
+    with open("puzzle.pkl", "rb") as f:
+            puzzle = pickle.load(f)  
+    return puzzle   
 
-pieces = get_pieces(dir = 'img')
-# pieces = get_pieces(dir = 'frame')
-# pieces = get_pieces(dir = 'internal', pieces = pieces)
+def write_puzzle(puzzle):
+    with open("puzzle.pkl", "wb") as f:
+        pickle.dump(puzzle, f)
 
-# init_puzzle(p_file = 'IMG_20250209_094955') 
-# match_frame()
-# match_puzzle(row0 = 1, row1 = M - 1, col0 = 1, col1 = N - 1)
+    with open("puzzle.md", "w") as f:
+        df = pd.DataFrame(puzzle, index=range(1, puzzle.shape[0] + 1), columns=range(1, puzzle.shape[1] + 1))
+        f.write(df.to_markdown(index=True, mode='wt'))    
+
+    print('Puzzle saved')   
+
+def set_puzzle(puzzle, r, c, v):
+    puzzle[r-1, c-1] = v
+    write_puzzle(puzzle)
+    return puzzle
+
