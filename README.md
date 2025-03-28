@@ -12,7 +12,7 @@ In the next stage, the elements are compared to each other based on the criteria
 
 ![load](img/load.png)
 
-After physically checking if the element fits, the user confirms the selection by building a puzzle map (visible in the puzzle.md file)
+After physically checking if the element fits, the user confirms the selection by building a puzzle map (visible in the puzzle.md file) with id of each puzzle (number of piece and after dot number of edge)
 
 ```txt
 |    |       1 |       2 |       3 |       4 |       5 |       6 |       7 |       8 | 
@@ -37,3 +37,14 @@ After physically checking if the element fits, the user confirms the selection b
 | 18 |  2017.3 | 30034.4 |    -1   |    -1   |    -1   |    -1   |    -1   |    -1   | 
 ```
 
+Example of incomplete puzzle
+
+![incomplete](img/incomplete.jpg){width=25%}
+
+All free elements are arranged in a matrix: 3 sets each with dimensions 10x10 and numbered according to the set number (x100) and element.
+
+![pieces](img/pieces.jpg){width=25%}
+
+Example of a complete image
+
+![complete](img/complete.jpg){width=25%}
