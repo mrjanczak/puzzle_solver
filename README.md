@@ -1,6 +1,8 @@
 # puzzle_solver
 
-Puzzle solver is a simple script that helps with solving puzzles. It only uses the shapes of the elements to fit them together correctly. To do this, each element should be photographed (I used the Timer Camera application for this purpose), preferably by illuminating the block from below through a diffusing layer (I used a table with a frosted glass top and a lamp placed underneath it). It is important that each photo is taken from exactly the same distance.
+Puzzle solver is a simple script that helps with solving puzzles. It only uses the shapes of the elements to fit them together correctly (ignoring color or pattern). It is useful to complement the image with a solid background if the brute force method is too cumbersome or beyond our patience :). 
+
+To use this tool, each element should be photographed (I used the Timer Camera application for this purpose), preferably by illuminating the block from below through a diffusing layer (I used a table with a frosted glass top and a lamp placed underneath it). It is important that each photo is taken from exactly the same distance. I took photos of the undersides of the pieces to more precisely capture their edges, but this is not necessary and introduces a number of complications (the puzzle map in the .md file is reversed left to right relative to the real puzzle). 
 
 ![example](example/cornerBR/IMG_20250327_230157.jpg){width=25%}
 
