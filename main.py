@@ -1,5 +1,6 @@
 import os
 import sys
+import copy
 import math 
 import numpy as np
 import pandas as pd
@@ -19,17 +20,12 @@ os.chdir(local)
 
 def _get_angle(v1, v2):
     # Compute cosine of angle using dot product
-    dot_product = np.dot(v1, v2)
-    cross_product = np.cross(v1, v2)
-    mag_v1 = np.linalg.norm(v1)
-    mag_v2 = np.linalg.norm(v2)
 
-    if mag_v1 == 0 or mag_v2 == 0:  # Avoid division by zero
-        angle = 0.0
-    else:
-        cos_angle = dot_product / (mag_v1 * mag_v2)
-        angle = np.arccos(np.clip(cos_angle, -1.0, 1.0)) * np.sign(cross_product)  # Convert to radians
-    return angle
+    dot_product = np.dot(v1, v2)  # Dot product
+    cross_product = np.cross(v1, v2)  # Determinant (cross product in 2D)    
+    angle_rad = np.arctan2(cross_product, dot_product)  # Signed angle in radians
+
+    return angle_rad
 
 def _get_contour(file, num_points, 
                  gauss_blur, eps_ratio, noise_treshold, savgol_kwargs):
@@ -160,8 +156,8 @@ def _get_locks(num_points, cnt2, s2, cum_a2,
         d_cum_a = cum_a2[i2] - cum_a2[i1]
         lock_dir = -np.sign(d_cum_a)
 
-        d_s_ratio =     (abs(d_s) - lock_s_range_[0])/np.diff(lock_s_range_)
-        d_cum_a_ratio = (abs(d_cum_a) - lock_cum_a_range[0])/np.diff(lock_cum_a_range)
+        d_s_ratio =     float((abs(d_s) - lock_s_range_[0])/np.diff(lock_s_range_))
+        d_cum_a_ratio = float((abs(d_cum_a) - lock_cum_a_range[0])/np.diff(lock_cum_a_range))
 
         # Continue if s or angle range out of range
         if not (0 < d_s_ratio < 1 and 0 < d_cum_a_ratio < 1):
@@ -244,7 +240,9 @@ def _get_locks(num_points, cnt2, s2, cum_a2,
         locks_sca_p34.append([s2[i3], cum_a2[i3]])
         locks_sca_p34.append([s2[i4], cum_a2[i4]])
 
-        locks_crit.append([s2[i], d_s_ratio, d_cum_a_ratio, mse_ratio])         
+        lock_crit = [s2[i], d_s_ratio, d_cum_a_ratio, mse_ratio]
+        locks_crit.append(lock_crit) 
+
         lock = {'i': [i3, i1, i, i2, i4], 'dir': lock_dir, 'pc': pc}
         locks.append(lock)                   
 
@@ -316,21 +314,22 @@ def _select_corners(num_points, cnt2, s2, cum_a2):
     ax.set_title("Click on the 4 real corners of the piece")
     plt.draw()
 
-    corners_cnt2 = plt.ginput(4, timeout=0)  
-    corners_cnt2 = np.array(corners_cnt2).reshape(-1, 2)
+    corners_cnt = plt.ginput(4, timeout=0)  
+    corners_cnt2 = np.array(corners_cnt).reshape(-1, 2)
     plt.scatter(*zip(*corners_cnt2), color='red', marker='x', s=100, label="Selected Corners")
     
     plt.close()
 
+    # Correct corner in contour cnt2
     corners_i = []
     for corner_cnt in corners_cnt2:
-        # Correct corner in contour cnt2
         distances = np.linalg.norm(cnt2[:num_points] - corner_cnt, axis=1)
         corner_i = np.argmin(distances)        
         corners_i.append(corner_i)
         cnt2[corner_i] = corner_cnt 
+
     corners_i.sort()
-    corners_i.append(corners_i[-1] + num_points)
+    corners_i.append(corners_i[0] + num_points)
 
     corners = []
     for corner_i in corners_i:       
@@ -419,11 +418,13 @@ def _get_edges(num_points, cnt2, s2, cum_a2, locks, corners):
         theta = _get_angle(v1, np.array([1,0])) 
         R = np.array([[np.cos(theta), -np.sin(theta)],
                         [np.sin(theta),  np.cos(theta)]])
+                
+        # Rotate edge contour
         e_cnt1 = cnt2[i1]
         e_cnt = cnt2[i1 : i2+1] - e_cnt1
         e_cnt = np.dot(e_cnt, R.T)
 
-        # Assign lock to edge
+        # Check if any lock occurs at edge
         lock = None
         for lock_ in locks:
             if (i1 <= lock_['i'][2] <= i2) or (i1 <= lock_['i'][2] + num_points <= i2):
@@ -432,17 +433,17 @@ def _get_edges(num_points, cnt2, s2, cum_a2, locks, corners):
 
         l_dir, l_pc = 0, None
         if lock:
-            # Get lock dir and rotated pc
+            # Rotate lock center point pc
             l_dir = lock['dir']
             l_pc = lock['pc']- e_cnt1
             l_pc = np.dot(l_pc, R.T)
         else:
             flat_edges.append(edge_i)
 
-        edges.append({'p1': p1, 'p2': p2, 'e_cnt': e_cnt, 'e_len': e_len, 'l_dir': l_dir, 'l_pc': l_pc}) #, 'e_sca': e_sca
+        edges.append({'p1': p1, 'p2': p2, 'e_cnt': e_cnt, 'e_len': e_len, 'l_dir': l_dir, 'l_pc': l_pc, 'cnt2_range': (i1,i2)}) 
 
-    # Rotate edges to have 1st non-flat
-    if len(flat_edges):
+    # Shift edges to start index just after last flat one
+    if len(flat_edges) > 0:
         e2 = edges + edges
         edge_i = max(flat_edges)
         edges = e2[edge_i+1 : edge_i + 5]
@@ -473,9 +474,11 @@ def _offset_edge(e_id, e_off):
         e_id += 4
     return e_id
 
-def get_pieces(  pieces_dir = None, files_range = None,
+def process_pieces(  pieces_dir = None, files_range = None,
                 pieces = {}, pieces_file = None, p_set = 0, select_corners = [], locks_range = [2,4],
-                plot_piece = False, start = 1, 
+                plot_piece = False, 
+                p_i_start = 0, 
+                p_set_mult = 100,
                 gauss_blur = (5,5), 
                 eps_ratio = .0004,
                 num_points = 200,
@@ -534,9 +537,9 @@ def get_pieces(  pieces_dir = None, files_range = None,
           """)
     pieces_len = len(filenames)
 
-    for piece_i, file in enumerate(filenames, start = start):
+    for piece_i, file in enumerate(filenames, start = p_i_start):
         plot_piece_i = plot_piece
-        piece_id = p_set*1000 + piece_i
+        piece_id = p_set*p_set_mult + piece_i
         file = os.path.join(pieces_dir,file)
                 
         cnt2, s2, cum_a2, preview, cnt_rect, cum_a2_raw, ca2_filtered = _get_contour(file, num_points, gauss_blur, eps_ratio, noise_treshold, savgol_kwargs)
@@ -592,6 +595,11 @@ def get_pieces(  pieces_dir = None, files_range = None,
             plot_i += 1
             axs[0,plot_i].plot(cnt2[:, 0], cnt2[:, 1], color="blue", marker=".")
             axs[0,plot_i].scatter(locks_pc[:, 0],  locks_pc[:, 1],  color="red", marker="+")
+
+            for corner_i, corner_cnt in enumerate(corners_cnt2):  
+                if corner_i < 5:                  
+                    axs[0,plot_i].text(corner_cnt[0]+corner_i*10, corner_cnt[1]+corner_i*10, str(corner_i), fontsize=8, color="red")
+
             axs[0,plot_i].scatter(locks_p0[:, 0],  locks_p0[:, 1],  color="red", marker="o")
             axs[0,plot_i].scatter(locks_p12[:, 0], locks_p12[:, 1], color="pink", marker="o")
             axs[0,plot_i].scatter(locks_p34[:, 0], locks_p34[:, 1], color="green", marker="o")
@@ -607,6 +615,7 @@ def get_pieces(  pieces_dir = None, files_range = None,
             axs[0,plot_i].scatter(locks_sca_p12[:, 0],locks_sca_p12[:, 1], color="pink", marker="o", s=50) # 
             axs[0,plot_i].scatter(locks_sca_p34[:, 0],locks_sca_p34[:, 1], color="green", marker="o", s=50) # 
             axs[0,plot_i].scatter(lines_crit[:, 0],   lines_crit[:, -1],   color="orange", marker="+", s=100)
+
             if corners_crit:
                 axs[0,plot_i].scatter(corners_crit[:, 0], corners_crit[:, -1], color="red", marker="x", s=100)
             axs[0,plot_i].set_title("locks")
@@ -685,11 +694,22 @@ def load_pieces( pieces = {}, pieces_file = None, p_set = 0, plot_pieces = True,
             if r == m:
                 break
 
-            cnt = piece['cnt']                        
+            cnt = piece['cnt']
+            cnt2 = np.vstack([cnt, cnt]) 
             locks_pc = piece['locks_pc']                        
             corners_cnt = piece['corners_cnt']   
-            file = piece['file']                     
-            axs[r,c].plot(   x_sign*cnt[:,0],         y_sign*cnt[:,1],         color='blue')
+            file = piece['file'] 
+
+            for edge in piece['edges']:  
+                i1, i2 = edge['cnt2_range']
+                if edge['l_dir'] > 0:
+                    color = 'red'
+                elif edge['l_dir'] < 0:
+                    color = 'blue'
+                else:
+                    color = 'gray'
+                axs[r,c].plot(   x_sign*cnt2[i1:i2+1,0], y_sign*cnt2[i1:i2+1,1], color=color)
+
             axs[r,c].scatter(x_sign*locks_pc[:,0],    y_sign*locks_pc[:,1],    color='red', marker='+')
             axs[r,c].scatter(x_sign*corners_cnt[:,0], y_sign*corners_cnt[:,1], color='red', marker='x')
             axs[r,c].set_title(f'{p_id}, {file[-10:-4]}', pad=0)
@@ -737,6 +757,8 @@ def init_puzzle(puzzle = (2, 2), pieces = [], p_file = None, p_id = None, p_pos 
     with open("puzzle.pkl", "wb") as f:
         pickle.dump(puzzle, f)
 
+    write_puzzle(puzzle)
+
     return puzzle
 
 def match_frame(puzzle, pieces):
@@ -748,14 +770,341 @@ def match_frame(puzzle, pieces):
 
     return puzzle
 
+def _get_candidates(puzzle, pieces, row, col, req_piece_type,
+                    e1_off, e2_off,_e1_off,_e2_off,p1_off,p2_off,
+                    lock_pc_crit = .2,
+                    edge_len_crit = .2,
+                    edge_dist_crit = 1000.,
+                    candidates_diff_crit = 10,
+                    c_per_page = 10,
+                    p_id_offset = 0, page = 0, ratio = 1, 
+                    plot_candidates = True, verbose = True):
+    
+    # Skip first or matched piece
+    piece_id = puzzle[row, col] 
+    if piece_id >= 0:
+        if verbose:
+            print(f'Skip piece {piece_id} already matched')
+        return None, 'p'            
+
+    # Get verticaly reference piece - p1
+    r1, c1 = row + p1_off[0], col + p1_off[1]
+    p1_id, e1_id = _get_p_e(puzzle, r1, c1)
+
+    # Get horizontaly reference piece - p2
+    r2, c2 = row + p2_off[0], col + p2_off[1]
+    p2_id, e2_id = _get_p_e(puzzle, r2, c2)
+    
+    print(f'\nProcessing piece ({row+1},{col+1})')
+    
+    e1_len, e1_cnt_inv, e1_linestr, l1_dir, l1_pc_inv = None, None, None, None, None
+    if p1_id is not None:
+
+        # Get opposite edge to matched previously in top-bottom or bottom-top match
+        e1_id = _offset_edge(e1_id, e1_off)
+
+        print(f'Vertically adjacent piece ({r1+1}, {c1+1}) {p1_id}.{e1_id+1}')
+        piece1 = pieces[p1_id]
+        edge1 = piece1['edges'][e1_id]
+        l1_dir = edge1.get('l_dir')
+        l1_pc = edge1.get('l_pc')
+        e1_cnt = edge1['e_cnt']
+        e1_len = edge1['e_len']
+
+        e1_cnt_inv = np.column_stack((e1_len - e1_cnt[:,0], -e1_cnt[:,1]))[::-1]
+        e1_linestr = LineString(e1_cnt_inv)
+
+        if l1_pc is not None:
+            l1_pc_inv = [e1_len - l1_pc[0], -l1_pc[1]]                           
+        
+    e2_len, e2_cnt_inv, e2_linestr, l2_dir, l2_pc_inv = None, None, None, None, None
+    if p2_id is not None:
+
+        # Get opposite edge to matched previously in horizontal match
+        e2_id = _offset_edge(e2_id, e2_off)
+
+        print(f'Horizontally adjacent piece ({r2+1}, {c2+1}) {p2_id}.{e2_id+1}')
+
+        piece2 = pieces[p2_id]
+        edge2 = piece2['edges'][e2_id]
+        e2_cnt = edge2['e_cnt']
+        e2_len = edge2['e_len']
+        l2_dir = edge2['l_dir']
+        l2_pc = edge2['l_pc']
+
+        e2_cnt_inv = np.column_stack((e2_len - e2_cnt[:,0], -e2_cnt[:,1]))[::-1]
+        e2_linestr = LineString(e2_cnt_inv)
+
+        if l2_pc is not None:
+            l2_pc_inv = [e2_cnt[-1,0] - l2_pc[0], -l2_pc[1]]
+
+    # Check all available pieces
+    candidates = []
+    for _p_id, _piece in pieces.items():
+        
+        file = _piece['file']                
+
+        # Skip pieces already used
+        if np.isin(puzzle, [_p_id+.1, _p_id+.2, _p_id+.3, _p_id+.4]).any():
+            if verbose==2:
+                print(f'Skip piece {_p_id} - already used')
+            continue
+        
+        # Try all edges of _piece - _e1_id is a TOP edge of _piece
+        for _e_id in range(4):     
+
+            piece_id = _p_id + (_e_id+1)/10  
+
+            _edges = _piece['edges']
+
+            # Get 1st edge to match verticaly
+            _e1_id = _offset_edge(_e_id, _e1_off)                    
+            _edge1 = _edges[_e1_id]
+            _e1_cnt = _edge1['e_cnt']
+            _l1_dir = _edge1['l_dir']
+            _l1_pc = _edge1['l_pc']
+
+            # Get 2nd edge to match horizontaly
+            _e2_id = _offset_edge(_e_id, _e2_off)                                                   
+            _edge2 =  _edges[_e2_id]
+            _e2_cnt = _edge2['e_cnt']    
+            _l2_dir = _edge2['l_dir']     
+            _l2_pc =  _edge2['l_pc']   
+
+            _e1_len = np.linalg.norm(_e1_cnt[-1]-_e1_cnt[0])
+            _e2_len = np.linalg.norm(_e2_cnt[-1]-_e2_cnt[0])
+
+            # Skip piece with wrong number of flat edges
+            piece_type = len(_piece['flat_edges'])
+            if piece_type != req_piece_type[row, col]:
+                if verbose:
+                    print(f'Skip piece {piece_id} with wrong number of flat edges ({piece_type} != {req_piece_type[row, col]})')
+                break
+
+            # Skip not flat horiz. external edge
+            if (col == 0 or col == N-1):
+                
+                if col == 0:
+                    _e3_id = _offset_edge(_e_id, 1)
+                if col == N-1:
+                    _e3_id = _offset_edge(_e_id, -1)
+
+                _edge3 = _piece['edges'][_e3_id]
+                _l3_dir = _edge3['l_dir']  
+
+                if _l3_dir != 0:
+                    if verbose:
+                        print(f'Skip edge {piece_id} with not flat external edge {_e3_id+1}')
+                    continue                    
+            
+            # Skip not flat vert. external edge
+            if (row == 0 or row == M-1):
+                
+                if row == 0:
+                    _e3_id = _offset_edge(_e_id, 0)
+                if row == M-1:
+                    _e3_id = _offset_edge(_e_id, 2)
+
+                _edge3 = _piece['edges'][_e3_id]
+                _l3_dir = _edge3['l_dir']  
+
+                if _l3_dir != 0:
+                    if verbose:
+                        print(f'Skip edge {piece_id} with not flat external edge {_e3_id+1}')
+                    continue
+
+
+            # Skip not-matching lock directions on edges
+            if _l1_dir and l1_dir and _l1_dir != -l1_dir:
+                if verbose:
+                    print(f'Skip edge {piece_id} - not-matching vertically')
+                continue
+
+            if _l2_dir and l2_dir and _l2_dir != -l2_dir:
+                if verbose:
+                    print(f'Skip edge {piece_id} - not-matching horizontally')
+                continue
+
+
+            # Skip edges with not matching length
+            if type(edge_len_crit) is float:
+                e1_len_dist = 0
+                if e1_len and _e1_len:
+                    e1_len_dist = np.abs(_e1_len - e1_len)/(e1_len*edge_len_crit)
+
+                e2_len_dist = 0
+                if e2_len and _e2_len:
+                    e2_len_dist = np.abs(_e2_len - e2_len)/(e2_len*edge_len_crit)
+
+                if e1_len_dist > 1 or e2_len_dist > 1:
+                    if verbose:
+                        print(f'Skip edge {piece_id} with not matching edge length', round(e1_len_dist,2), round(e2_len_dist,2))
+                    continue
+
+            # Skip pieces with not matching lock center
+            l1_pc_dist, l2_pc_dist = 0, 0
+            if type(lock_pc_crit) is float:
+                l1_pc_dist = 0
+                if _l1_pc is not None and l1_pc_inv is not None and e1_len:
+                    l1_pc_dist = np.linalg.norm(_l1_pc - l1_pc_inv)/(e1_len*lock_pc_crit) 
+                    
+                l2_pc_dist = 0
+                if _l2_pc is not None and l2_pc_inv is not None and e2_len:
+                    l2_pc_dist = np.linalg.norm(_l2_pc-l2_pc_inv)/(e2_len*lock_pc_crit)
+
+                if l1_pc_dist > 1 or l2_pc_dist > 1:
+                    if verbose:
+                        print(f'Skip edge {piece_id} with not matching lock center', round(l1_pc_dist,2), round(l2_pc_dist,2))
+                    continue
+
+            # Skip pieces with not matching edges angle
+            # if type(edge_angle_crit) is float and row != row0 and col != col0:
+
+            #     p0 = puzzle_corners[row, col]
+            #     p1 = puzzle_corners[row, col+d_c]
+            #     p2 = puzzle_corners[row+d_r, col]
+
+            #     v1 = p1 - p0
+            #     v2 = p2 - p0          
+            #     e12_angle = abs(_get_angle(v1, v2))
+
+            #     _e1_p1 = _edge1['p1']
+            #     _e1_p2 = _edge1['p2']
+            #     _e2_p1 = _edge2['p1']
+            #     _e2_p2 = _edge2['p2']
+
+            #     _v1 = _e1_p2 - _e1_p1  
+            #     _v2 = _e2_p2 - _e2_p1          
+            #     _e12_angle = _get_angle(_v1, _v2)
+
+            #     if e12_angle > 0 and np.abs(_e12_angle - e12_angle)/(e12_angle*edge_angle_crit) > 1:
+            #         if verbose:
+            #             print(f'Skip piece {piece_id} with not matching edge angle', round(_e12_angle,2), round(e12_angle,2))
+            #         continue
+                
+            # Measure how firmly pieces match to each other
+            e1_dist, e2_dist = 0, 0
+            if type(edge_dist_crit) == float:
+                
+                if e1_linestr:
+                    _e1_dist = [Point(p).distance(e1_linestr) for p in _e1_cnt]                    
+                    e1_dist = np.sum(_e1_dist) / edge_dist_crit
+            
+                if e2_linestr:
+                    _e2_dist = [Point(p).distance(e2_linestr) for p in _e2_cnt]                    
+                    e2_dist = np.sum(_e2_dist) / edge_dist_crit
+                
+                if e1_dist > 1 or e2_dist > 1:
+                    if verbose:
+                        print(f'Skip edge {piece_id} above edge_dist_crit', e1_dist, e2_dist)
+                    continue
+
+            # Append candidate                    
+            total_dist = (e1_dist**2 + e2_dist**2)**.5
+            candidate = {'p_id': _p_id, 'e_id': _e_id, 'p_file': _piece['file'], 'edges': _edges,
+                        'dist': total_dist, 'dist_crit': np.array([l1_pc_dist, e1_dist, l2_pc_dist, e2_dist]).round(2),
+                        }
+            candidates.append(candidate)
+                                
+    if len(candidates) == 0:
+        print(f'No candidates found for ({row+1},{col+1})')  
+        inp = input(f'Enter p to skip piece, c to skip col., + to get more candidates, q quit', ).strip()
+        return None, inp
+    
+    # Sort candidates            
+    candidates = sorted(candidates, key=lambda c: c["dist"]) 
+
+    candidates = candidates[:c_per_page*int(1+(ratio-1)*4)]
+
+    # List all candidates
+    print(f'For loc ({row+1},{col+1}) (p1 {p1_id}.{e1_id}) found {len(candidates)} candidates (page {page}, ratio {ratio}):')
+    
+    recommended = ''
+    if len(candidates) > 1:
+        c0_dist = candidates[0]['dist']
+        c1_dist = candidates[1]['dist']
+
+        if c0_dist > 0 and (c1_dist - c0_dist)/c0_dist < candidates_diff_crit:
+            recommended = ' - RECOMMENDED'
+    
+    for c, candidate in enumerate(candidates):
+        p_id = candidate['p_id']
+        e_id = candidate['e_id']      
+        file = candidate['p_file']
+        dist_crit = candidate['dist_crit']
+
+        # if 2 first pieces have sufficiently big difference in dist_crit, 1st is recommended
+        print(f'({c}) - {p_id+p_id_offset}.{e_id+1}, file={file}, dist_crit={dist_crit}{recommended}')
+        recommended = ''
+
+    # Plot page by page
+    if plot_candidates:
+        pages = math.ceil(len(candidates)/c_per_page)
+        for page in range(pages):
+
+            _candidates = candidates[page*c_per_page : ]      
+            candidates_num = min(c_per_page, len(_candidates))
+            _candidates = _candidates[ : candidates_num]
+
+            fig, axs = plt.subplots(3, max(candidates_num,2), figsize=(10, 5))                
+            for c, candidate in enumerate(_candidates):
+
+                _p_id = candidate['p_id']
+                _e_id = candidate['e_id']
+                _piece = pieces[_p_id]
+                _cnt = _piece['cnt']
+
+                # Get candidte edge to match verticaly
+                _e1_id = _offset_edge(_e_id, _e1_off)
+                _edge1 = pieces[_p_id]['edges'][_e1_id]
+                _e1_cnt = _edge1['e_cnt']
+                _l1_dir = _edge1['l_dir']
+                _l1_pc =  _edge1['l_pc']
+
+                # Get candidte edge to match horizontaly
+                _e2_id = _offset_edge(_e_id, _e2_off)
+                _edge2 = pieces[_p_id]['edges'][_e2_id]
+                _e2_cnt = _edge2['e_cnt']
+                _l2_dir = _edge2['l_dir']
+                _l2_pc =  _edge2['l_pc'] 
+
+                if e1_cnt_inv is not None:
+                    axs[0,c].plot(e1_cnt_inv[:,0], e1_cnt_inv[:,1], color='blue')
+                if l1_pc_inv is not None:
+                    axs[0,c].scatter(l1_pc_inv[0], l1_pc_inv[1], color='blue', marker='+')
+                if _e1_cnt is not None: # isinstance(_e1_cnt, np.ndarray) and _e1_cnt.ndim == 2 :
+                    axs[0,c].plot(_e1_cnt[:,0], _e1_cnt[:,1], color='red')
+                if _l1_pc is not None: # isinstance(_l1_pc, np.ndarray) and _l1_pc.ndim == 2:
+                    axs[0,c].scatter(_l1_pc[0], _l1_pc[1], color='red', marker='+')
+                    axs[0,c].set_title(f'{_p_id+p_id_offset}.{_e_id+1}')
+                    axs[0,c].axis('equal')
+
+                if e2_cnt_inv is not None:
+                    axs[1,c].plot(e2_cnt_inv[:, 0], e2_cnt_inv[:, 1], color="blue")
+                if l2_pc_inv is not None:
+                    axs[1,c].scatter(l2_pc_inv[0], l2_pc_inv[1], color='blue', marker='+')
+                if _e2_cnt is not None: # isinstance(_e2_cnt, np.ndarray) and _e2_cnt.ndim == 2:
+                    axs[1,c].plot(_e2_cnt[:,0], _e2_cnt[:,1], color='red')
+                if _l2_pc is not None: # isinstance(_l2_pc, np.ndarray) and _l2_pc.ndim == 2:
+                    axs[1,c].scatter(_l2_pc[0], _l2_pc[1], color='red', marker='+')
+                    axs[1,c].set_title(f'{_p_id+p_id_offset}.{_e_id+1}')
+                    axs[1,c].axis('equal')
+
+                axs[2,c].plot(_cnt[:,0], _cnt[:,1], color='blue')
+
+            fig.suptitle(f'page {page}, loc ({row+1},{col+1}), p1 {p1_id}.{e1_id}, p2 {p2_id}.{e2_id}')
+            plt.show()
+
+    return candidates, None
+
 def match_puzzle(puzzle, pieces, from_pos = (2,1), to_pos = (3,1), 
                  lock_pc_crit = .2,
                  edge_len_crit = .2,
-                 edge_angle_crit = None, # test in progress
-                 edge_dist_crit = 500.,
+                 edge_dist_crit = 1000.,
 
                  candidates_diff_crit = 10,
-                 plot_candidates = True, confirm = True, verbose = True
+                 p_id_offset = 0, 
+                 plot_candidates = True, verbose = True
                  ):
     """
         Default orientation of corner piece
@@ -795,7 +1144,7 @@ def match_puzzle(puzzle, pieces, from_pos = (2,1), to_pos = (3,1),
 
     """
     M, N = puzzle.shape
-    puzzle_corners = np.zeros((M+1, N+1, 2), dtype=float)
+    # puzzle_corners = np.zeros((M+1, N+1, 2), dtype=float)
 
     # Use rows and cols starting from 0
     row0, col0 = from_pos
@@ -834,334 +1183,45 @@ def match_puzzle(puzzle, pieces, from_pos = (2,1), to_pos = (3,1),
 
     for col in cols:
         for row in rows:
-            
-            # Skip first or matched piece
-            piece_id = puzzle[row, col] 
-            if piece_id >= 0:
-                if verbose:
-                    print(f'Skip piece {piece_id} already matched')
-                continue            
 
-            # Get verticaly reference piece - p1
-            r1, c1 = row + p1_off[0], col + p1_off[1]
-            p1_id, e1_id = _get_p_e(puzzle, r1, c1)
+            for ratio in [1., 1.25, 1.5]:
 
-            # Get horizontaly reference piece - p2
-            r2, c2 = row + p2_off[0], col + p2_off[1]
-            p2_id, e2_id = _get_p_e(puzzle, r2, c2)
-            
-            print(f'\nProcessing piece ({row+1},{col+1})')
-            
-            e1_len, e1_cnt_inv, e1_linestr, l1_dir, l1_pc_inv = None, None, None, None, None
-            if p1_id is not None:
+                candidates, inp = _get_candidates(puzzle, pieces, row, col, req_piece_type,
+                                            e1_off, e2_off,_e1_off,_e2_off,p1_off,p2_off,
 
-                # Get opposite edge to matched previously in top-bottom or bottom-top match
-                e1_id = _offset_edge(e1_id, e1_off)
+                                            lock_pc_crit = lock_pc_crit*ratio,
+                                            edge_len_crit = edge_len_crit*ratio,
+                                            edge_dist_crit = edge_dist_crit*ratio,
 
-                print(f'Vertically adjacent piece ({r1+1}, {c1+1}) {p1_id}.{e1_id+1}')
-                piece1 = pieces[p1_id]
-                edge1 = piece1['edges'][e1_id]
-                l1_dir = edge1.get('l_dir')
-                l1_pc = edge1.get('l_pc')
-                e1_cnt = edge1['e_cnt']
-                e1_len = edge1['e_len']
-
-                e1_cnt_inv = np.column_stack((e1_len - e1_cnt[:,0], -e1_cnt[:,1]))[::-1]
-                e1_linestr = LineString(e1_cnt_inv)
-
-                if l1_pc is not None:
-                    l1_pc_inv = [e1_len - l1_pc[0], -l1_pc[1]]                           
+                                            candidates_diff_crit = candidates_diff_crit, 
+                                            p_id_offset = p_id_offset, ratio = ratio,
+                                            plot_candidates = plot_candidates, verbose = verbose)        
                 
-            e2_len, e2_cnt_inv, e2_linestr, l2_dir, l2_pc_inv = None, None, None, None, None
-            if p2_id is not None:
+                c_id = None
+                if isinstance(candidates, list) and inp is None:
+                    inp = input(f'Input candidate id (0 default, p to skip piece, c to skip col., + to get more candidates, q quit)', ).strip()
+                    if inp.isnumeric():
+                        c_id = int(inp)
+                    else:
+                        c_id = 0
 
-                # Get opposite edge to matched previously in horizontal match
-                e2_id = _offset_edge(e2_id, e2_off)
-
-                print(f'Horizontally adjacent piece ({r2+1}, {c2+1}) {p2_id}.{e2_id+1}')
-
-                piece2 = pieces[p2_id]
-                edge2 = piece2['edges'][e2_id]
-                e2_cnt = edge2['e_cnt']
-                e2_len = edge2['e_len']
-                l2_dir = edge2['l_dir']
-                l2_pc = edge2['l_pc']
-
-                e2_cnt_inv = np.column_stack((e2_len - e2_cnt[:,0], -e2_cnt[:,1]))[::-1]
-                e2_linestr = LineString(e2_cnt_inv)
-
-                if l2_pc is not None:
-                    l2_pc_inv = [e2_cnt[-1,0] - l2_pc[0], -l2_pc[1]]
-
-            # Check all available pieces
-            candidates = []
-            for _p_id, _piece in pieces.items():
-                
-                file = _piece['file']                
-
-                # Skip pieces already used
-                if np.isin(puzzle, [_p_id+.1, _p_id+.2, _p_id+.3, _p_id+.4]).any():
-                    if verbose==2:
-                        print(f'Skip piece {_p_id} - already used')
+                if inp == '+':
                     continue
-                
-                # Try all edges of _piece - _e1_id is a TOP edge of _piece
-                for _e_id in range(4):     
-
-                    piece_id = _p_id + (_e_id+1)/10  
-
-                    # Get 1st edge to match verticaly
-                    _e1_id = _offset_edge(_e_id, _e1_off)                    
-                    _edge1 = _piece['edges'][_e1_id]
-                    _e1_cnt = _edge1['e_cnt']
-                    _l1_dir = _edge1['l_dir']
-                    _l1_pc = _edge1['l_pc']
-
-                    # Get 2nd edge to match horizontaly
-                    _e2_id = _offset_edge(_e_id, _e2_off)                                                   
-                    _edge2 =  _piece['edges'][_e2_id]
-                    _e2_cnt = _edge2['e_cnt']    
-                    _l2_dir = _edge2['l_dir']     
-                    _l2_pc =  _edge2['l_pc']   
-
-                    _e1_len = np.linalg.norm(_e1_cnt[-1]-_e1_cnt[0])
-                    _e2_len = np.linalg.norm(_e2_cnt[-1]-_e2_cnt[0])
-
-                    # Skip piece with wrong number of flat edges
-                    piece_type = len(_piece['flat_edges'])
-                    if piece_type != req_piece_type[row, col]:
-                        if verbose:
-                            print(f'Skip piece {piece_id} with wrong number of flat edges ({piece_type} != {req_piece_type[row, col]})')
-                        break
-
-                    # Skip not flat horiz. external edge
-                    if (col == 0 or col == N-1):
-                        
-                        if col == 0:
-                            _e3_id = _offset_edge(_e_id, 1)
-                        if col == N-1:
-                            _e3_id = _offset_edge(_e_id, -1)
-
-                        _edge3 = _piece['edges'][_e3_id]
-                        _l3_dir = _edge3['l_dir']  
-
-                        if _l3_dir != 0:
-                            if verbose:
-                                print(f'Skip edge {piece_id} with not flat external edge {_e3_id+1}')
-                            continue                    
-                    
-                    # Skip not flat vert. external edge
-                    if (row == 0 or row == M-1):
-                        
-                        if row == 0:
-                            _e3_id = _offset_edge(_e_id, 0)
-                        if row == M-1:
-                            _e3_id = _offset_edge(_e_id, 2)
-
-                        _edge3 = _piece['edges'][_e3_id]
-                        _l3_dir = _edge3['l_dir']  
-
-                        if _l3_dir != 0:
-                            if verbose:
-                                print(f'Skip edge {piece_id} with not flat external edge {_e3_id+1}')
-                            continue
-
-
-                    # Skip not-matching lock directions on edges
-                    if _l1_dir and l1_dir and _l1_dir != -l1_dir:
-                        if verbose:
-                            print(f'Skip edge {piece_id} - not-matching vertically')
-                        continue
-
-                    if _l2_dir and l2_dir and _l2_dir != -l2_dir:
-                        if verbose:
-                            print(f'Skip edge {piece_id} - not-matching horizontally')
-                        continue
-
-
-                    # Skip edges with not matching length
-                    if type(edge_len_crit) is float:
-                        e1_len_dist = 0
-                        if e1_len and _e1_len:
-                            e1_len_dist = np.abs(_e1_len - e1_len)/(e1_len*edge_len_crit)
-
-                        e2_len_dist = 0
-                        if e2_len and _e2_len:
-                            e2_len_dist = np.abs(_e2_len - e2_len)/(e2_len*edge_len_crit)
-
-                        if e1_len_dist > 1 or e2_len_dist > 1:
-                            if verbose:
-                                print(f'Skip edge {piece_id} with not matching edge length', round(e1_len_dist,2), round(e2_len_dist,2))
-                            continue
-
-                    # Skip pieces with not matching lock center
-                    l1_pc_dist, l2_pc_dist = 0, 0
-                    if type(lock_pc_crit) is float:
-                        l1_pc_dist = 0
-                        if _l1_pc is not None and l1_pc_inv is not None and e1_len:
-                            l1_pc_dist = np.linalg.norm(_l1_pc - l1_pc_inv)/(e1_len*lock_pc_crit) 
-                            
-                        l2_pc_dist = 0
-                        if _l2_pc is not None and l2_pc_inv is not None and e2_len:
-                            l2_pc_dist = np.linalg.norm(_l2_pc-l2_pc_inv)/(e2_len*lock_pc_crit)
-
-                        if l1_pc_dist > 1 or l2_pc_dist > 1:
-                            if verbose:
-                                print(f'Skip edge {piece_id} with not matching lock center', round(l1_pc_dist,2), round(l2_pc_dist,2))
-                            continue
-
-                    # Skip pieces with not matching edges angle
-                    if type(edge_angle_crit) is float and row != row0 and col != col0:
-
-                        p0 = puzzle_corners[row, col]
-                        p1 = puzzle_corners[row, col+d_c]
-                        p2 = puzzle_corners[row+d_r, col]
-
-                        v1 = p1 - p0
-                        v2 = p2 - p0          
-                        e12_angle = abs(_get_angle(v1, v2))
-
-                        _e1_p1 = _edge1['p1']
-                        _e1_p2 = _edge1['p2']
-                        _e2_p1 = _edge2['p1']
-                        _e2_p2 = _edge2['p2']
-
-                        _v1 = _e1_p2 - _e1_p1  
-                        _v2 = _e2_p2 - _e2_p1          
-                        _e12_angle = _get_angle(_v1, _v2)
-
-                        if e12_angle > 0 and np.abs(_e12_angle - e12_angle)/(e12_angle*edge_angle_crit) > 1:
-                            if verbose:
-                                print(f'Skip piece {piece_id} with not matching edge angle', round(_e12_angle,2), round(e12_angle,2))
-                            continue
-                     
-                    # Measure how firmly pieces match to each other
-                    e1_dist, e2_dist = 0, 0
-                    if type(edge_dist_crit) == float:
-                        
-                        if e1_linestr:
-                            _e1_dist = [Point(p).distance(e1_linestr) for p in _e1_cnt]                    
-                            e1_dist = np.sum(_e1_dist) / edge_dist_crit
-                    
-                        if e2_linestr:
-                            _e2_dist = [Point(p).distance(e2_linestr) for p in _e2_cnt]                    
-                            e2_dist = np.sum(_e2_dist) / edge_dist_crit
-                        
-                        if e1_dist > 1 or e2_dist > 1:
-                            if verbose:
-                                print(f'Skip edge {piece_id} above edge_dist_crit', e1_dist, e2_dist)
-                            continue
-
-                    # Append candidate                    
-                    total_dist = (e1_dist**2 + e2_dist**2)**.5
-                    candidate = {'p_id': _p_id, 'e_id': _e_id, 'p_file': _piece['file'], 
-                                'dist': total_dist, 'dist_crit': np.array([l1_pc_dist, e1_dist, l2_pc_dist, e2_dist]).round(2),
-                                }
-                    candidates.append(candidate)
-                                        
-            if len(candidates) == 0:
-                print(f'No candidates found for ({row+1},{col+1})')  
-                c_id_str = input(f'Enter -1 to skip or -2 to exit', ).strip()
-
-                if c_id_str == '-1':
-                    break
-
-                if c_id_str == '-2':
-                    # terminate and save puzzle
-                    write_puzzle(puzzle)
-                    exit()
-            
-            # Sort candidates            
-            candidates = sorted(candidates, key=lambda c: c["dist"])            
-            max_cand = min(4, len(candidates))
-
-            # List candidates
-            print(f'For loc ({row+1},{col+1}) (p1 {p1_id}.{e1_id}) found {len(candidates)} candidates:')
-            
-            recommended = ''
-            if len(candidates) > 1:
-                c0_dist = candidates[0]['dist']
-                c1_dist = candidates[1]['dist']
-
-                if c0_dist > 0 and (c1_dist - c0_dist)/c0_dist < candidates_diff_crit:
-                    recommended = ' - RECOMMENDED'
-            
-            for i, candidate in enumerate(candidates[:max_cand]):
-                p_id = candidate['p_id']
-                e_id = candidate['e_id']      
-                file = candidate['p_file']
-                dist_crit = candidate['dist_crit']
-
-                # if 2 first pieces have sufficiently big difference in dist_crit, 1st is recommended
-                print(f'({i}) - {p_id}.{e_id+1}, file={file}, dist_crit={dist_crit}{recommended}')
-                recommended = ''
-
-            # Plot candidates
-            if plot_candidates:
-                fig, axs = plt.subplots(2, max(max_cand,2), figsize=(10, 5))                
-                for c, candidate in enumerate(candidates[:max_cand]):
-
-                    _p_id = candidate['p_id']
-                    _e_id = candidate['e_id']
-
-                    # Get candidte edge to match verticaly
-                    _e1_id = _offset_edge(_e_id, _e1_off)
-                    _edge1 = pieces[_p_id]['edges'][_e1_id]
-                    _e1_cnt = _edge1['e_cnt']
-                    _l1_dir = _edge1['l_dir']
-                    _l1_pc =  _edge1['l_pc']
-
-                    # Get candidte edge to match horizontaly
-                    _e2_id = _offset_edge(_e_id, _e2_off)
-                    _edge2 = pieces[_p_id]['edges'][_e2_id]
-                    _e2_cnt = _edge2['e_cnt']
-                    _l2_dir = _edge2['l_dir']
-                    _l2_pc =  _edge2['l_pc']                            
-
-                    if e1_cnt_inv is not None:
-                        axs[0,c].plot(e1_cnt_inv[:,0], e1_cnt_inv[:,1], color='blue', marker='.')
-                    if l1_pc_inv is not None:
-                        axs[0,c].scatter(l1_pc_inv[0], l1_pc_inv[1], color='blue', marker='+')
-                    if isinstance(_e1_cnt, np.ndarray) and _e1_cnt.ndim == 2 :
-                        axs[0,c].plot(_e1_cnt[:,0], _e1_cnt[:,1], color='red', marker='.')
-                    if _l1_pc is not None:
-                        axs[0,c].scatter(_l1_pc[0], _l1_pc[1], color='red', marker='+')
-                        axs[0,c].set_title(f'{_p_id}:{_e_id+1}')
-                        axs[0,c].axis('equal')
-
-                    if e2_cnt_inv is not None:
-                        axs[1,c].plot(e2_cnt_inv[:, 0], e2_cnt_inv[:, 1], color="blue", marker=".")
-                    if l2_pc_inv is not None:
-                        axs[1,c].scatter(l2_pc_inv[0], l2_pc_inv[1], color='blue', marker='+')
-                    if isinstance(_e2_cnt, np.ndarray) and _e2_cnt.ndim == 2:
-                        axs[1,c].plot(_e2_cnt[:,0], _e2_cnt[:,1], color='red', marker=".")
-                    if _l1_pc is not None:
-                        axs[1,c].scatter(_l2_pc[0], _l2_pc[1], color='red', marker='+')
-                        axs[1,c].set_title(f'{_p_id}:{_e_id+1}')
-                        axs[1,c].axis('equal')
-
-                fig.suptitle(f'loc ({row+1},{col+1}), p1 {p1_id}.{e1_id}, p2 {p2_id}.{e2_id}')
-                plt.show()
-
-            # if 2 first pieces have too close match, plot and confirm final choice of candidate
-            if confirm:
-                c_id_str = input(f'Input candidate id (0 default, -1 to skip, -2 to exit)', ).strip()
-                if c_id_str.isnumeric():
-                    c_id = int(c_id_str)
-                # Convert default empty str to 0
                 else:
-                    c_id = 0
-
-                if c_id == -1:
-                    # terminate and save puzzle
                     break
 
-                if c_id == -2:
-                    # terminate and save puzzle
-                    write_puzzle
-                    exit()
-            else:
-                c_id = 0
+            # Skip piece
+            if inp == 'p':
+                continue
+
+            # Skip column
+            elif inp == 'c':
+                break
+            
+            # Quit
+            elif inp == 'q':
+                exit()
+
 
             if 0 <= c_id < len(candidates):
                 p_id = candidates[c_id]['p_id']
@@ -1171,10 +1231,9 @@ def match_puzzle(puzzle, pieces, from_pos = (2,1), to_pos = (3,1),
 
             # Save matched piece
             piece_id = p_id + (e_id+1)/10
-            print(f'Set piece {piece_id} in ({row+1},{col+1})')
             puzzle[row, col] = piece_id
-
-    write_puzzle(puzzle)    
+            write_puzzle(puzzle)   
+            print(f'Set piece {piece_id+p_id_offset} in ({row+1},{col+1})')
 
     return puzzle      
 
@@ -1189,49 +1248,75 @@ def write_puzzle(puzzle):
 
     with open("puzzle.md", "w") as f:
         df = pd.DataFrame(puzzle, index=range(1, puzzle.shape[0] + 1), columns=range(1, puzzle.shape[1] + 1))
-        f.write(df.to_markdown(index=True, mode='wt'))       
+        f.write(df.to_markdown(index=True, mode='wt'))    
+
+    print('Puzzle saved')   
+
+def set_puzzle(puzzle, r, c, v):
+    puzzle[r-1, c-1] = v
+    write_puzzle(puzzle)
+    return puzzle
 
 if __name__ == "__main__":
 
     # puzzle size
     M, N = 36, 28
 
-    # tests - sets 5 - 9
-    # get_pieces(p_set = 5, pieces_dir = 'row1v2', files_range = [14,27], plot_piece=True, locks_range=[2,3], select_corners=[])
+    # Tests
+    # process_pieces(p_set = 100, pieces_dir = 'corBR', files_range = [10,11], plot_piece=True, locks_range=[2,3])
+    # exit()
 
-    # Recognize pieces
-    # get_pieces(p_set = 0, pieces_dir = 'col1')
-    # get_pieces(p_set = 1, pieces_dir = 'row1v2')  
-    # get_pieces(p_set = 2, pieces_dir = 'colM')
+    # My convention used for Vermer - not recommended
+    # p_i_start = 1
+    # p_set_mult = 1000   
+    # p_id_offset = 10 # piece_id printed in terminal (in puzzle[] id has no offset) - I marked my real pieces with id starting from 11 to 110 within each set
+
+    # Recommended convention
+    p_i_start = 0
+    p_set_mult = 100 # puzzle table in .md format is narrower   
+    p_id_offset = 0 # id in puzzle[] and on real puzzle are consistent - mark your pieces from 0 to 99 within each set
+
+    # Step 1. Process all pieces and save (You can also add some pieces later in subsequent sets)
+    # process_pieces(p_set = 0, pieces_dir = 'col1',   locks_range=[2,3], p_i_start = p_i_start, p_set_mult = p_set_mult)
+    # process_pieces(p_set = 1, pieces_dir = 'row1',   locks_range=[2,3], p_i_start = p_i_start, p_set_mult = p_set_mult)  
+    # process_pieces(p_set = 2, pieces_dir = 'colM',   locks_range=[2,3], p_i_start = p_i_start, p_set_mult = p_set_mult)
+    # process_pieces(p_set = 3, pieces_dir = 'corBR',  locks_range=[2,3], p_i_start = p_i_start, p_set_mult = p_set_mult)
     
-    # get_pieces(p_set = 10, pieces_dir = 'int20', min_locks = 4, files_range = [1,100], locks_range=[4,4])
-    # get_pieces(p_set = 20, pieces_dir = 'int20', min_locks = 4, files_range = [1,100], locks_range=[4,4])
-    # get_pieces(p_set = 30, pieces_dir = 'int30', min_locks = 4, files_range = [1,100], locks_range=[4,4])
-    # get_pieces(p_set = 40, pieces_dir = 'int40', min_locks = 4, files_range = [1,10] , locks_range=[4,4])
+    # process_pieces(p_set = 10, pieces_dir = 'int10', locks_range=[4,4], p_i_start = p_i_start, p_set_mult = p_set_mult, files_range = [1,100])
+    # process_pieces(p_set = 20, pieces_dir = 'int20', locks_range=[4,4], p_i_start = p_i_start, p_set_mult = p_set_mult, files_range = [1,100])
+    # process_pieces(p_set = 30, pieces_dir = 'int30', locks_range=[4,4], p_i_start = p_i_start, p_set_mult = p_set_mult, files_range = [1,100])
+    # process_pieces(p_set = 40, pieces_dir = 'int40', locks_range=[4,4], p_i_start = p_i_start, p_set_mult = p_set_mult, files_range = [1,11] )
 
-    # Load pieces
+    # Step 2. Load needed pieces
     pieces = {}
-    pieces = load_pieces(p_set = 0, pieces = pieces, plot_pieces=False)
-    pieces = load_pieces(p_set = 1, pieces = pieces, plot_pieces=False)
-    pieces = load_pieces(p_set = 2, pieces = pieces, plot_pieces=False)
+    pieces = load_pieces(p_set = 0, pieces = pieces)
+    pieces = load_pieces(p_set = 1, pieces = pieces)
+    pieces = load_pieces(p_set = 2, pieces = pieces)
+    pieces = load_pieces(p_set = 3, pieces = pieces)
 
-    # pieces = load_pieces(p_set = 10, pieces = pieces)
-    # pieces = load_pieces(p_set = 20, pieces = pieces)
-    # pieces = load_pieces(p_set = 30, pieces = pieces)
-    # pieces = load_pieces(p_set = 40, pieces = pieces)
+    pieces = load_pieces(p_set = 10, pieces = pieces)
+    pieces = load_pieces(p_set = 20, pieces = pieces)
+    pieces = load_pieces(p_set = 30, pieces = pieces)
+    pieces = load_pieces(p_set = 40, pieces = pieces)
 
-    # Initiate puzzle
+    # Step 3. Initiate puzzle
     # puzzle = init_puzzle(puzzle = (M, N), pieces = pieces, p_file = 'IMG_20250322_165940', p_pos = (1,N), p_edge = 4) 
-    
+    # puzzle = init_puzzle(puzzle = puzzle, pieces = pieces, p_file = 'IMG_20250327_230157', p_pos = (M,1), p_edge = 2) 
+
+    # Step 4. Match frame
+    # puzzle = match_puzzle(puzzle, pieces, from_pos=(1,N), to_pos=(M,N),      p_id_offset = p_id_offset )
+    # puzzle = match_puzzle(puzzle, pieces, from_pos=(1,N), to_pos=(1,1),      p_id_offset = p_id_offset )
+    # puzzle = match_puzzle(puzzle, pieces, from_pos=(1,1), to_pos=(23,1),     p_id_offset = p_id_offset )
+    # puzzle = match_puzzle(puzzle, pieces, from_pos=(M-1, 2), to_pos=(M-8,3), p_id_offset = p_id_offset )
+
+    # Step 5. Match internal pieces
+
     # Read puzzle
     puzzle = read_puzzle()
-    puzzle[0, 0: N-1] = -1
     
-    # Match pieces
-    # puzzle = match_puzzle(puzzle, pieces, from_pos=(1,N), to_pos=(M,N) )
-    # puzzle = match_puzzle(puzzle, pieces, from_pos=(1,N), to_pos=(1,1), plot_candidates=False)
-    puzzle = match_puzzle(puzzle, pieces, from_pos=(1,1), to_pos=(M,1), plot_candidates=False, verbose=True)
+    # Update puzzle manually if needed
+    # puzzle = set_puzzle(puzzle, 36, 1, -1)
 
-    write_puzzle(puzzle)
+    puzzle = match_puzzle(puzzle, pieces, from_pos=(M-1, 2), to_pos=(M-8,3), verbose=False, p_id_offset = p_id_offset )
 
 
