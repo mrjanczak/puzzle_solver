@@ -1,20 +1,20 @@
 # puzzle_solver
 
-Puzzle solver is a simple script that helps with solving puzzles. It only uses the shapes of the elements to fit them together correctly (ignoring color or pattern). It is useful to complement the image with a solid background if the brute force method is too cumbersome or beyond our patience :). 
+Puzzle solver is a simple script that helps with solving puzzles. It only uses the shapes of the elements to fit them together correctly (ignoring color or pattern). It is useful to complete the image with a solid background if it is too cumbersome or beyond our patience :). 
 
-To use this tool, each element should be photographed (I used the Timer Camera application for this purpose), preferably by illuminating the block from below through a diffusing layer (I used a table with a frosted glass top and a lamp placed underneath it). It is important that each photo is taken from exactly the same distance. I took photos of the undersides of the pieces to more precisely capture their edges, but this is not necessary and introduces a number of complications (the puzzle map in the .md file is reversed left to right relative to the real puzzle). 
+To use this tool, each element should be photographed (I used the Timer Camera application for this purpose), preferably by illuminating the block from below through a diffusing layer (I used a table with a frosted glass top and a lamp placed underneath it). It is important that each photo is taken from exactly the same distance. I took photos of the undersides of the pieces to more precisely capture their edges, but this is not necessary and introduces a number of complications (the puzzle map in the .md file is then reversed left to right relative to the real puzzle). 
 
-![example](example/cornerBR/IMG_20250327_230157.jpg){width=25%}
+![example](example/cornerBR/IMG_20250327_230157.jpg)
 
-The program then analyzes the image, extracts the contour from it, converts it into a series of vectors and calculates the course of deviations of each subsequent vector from the previous one. On this basis, it determines the position and orientation of the lock on each side and then determines the position of the corners.
+The program then analyzes the images, extracts the contour, converts into a series of vectors and calculates the course of deviations of each subsequent vector from the previous one (unrolled contour). On this basis, it determines the position and direction of the lock on each edge and then determines the position of the corners.
 
 ![process](img/process.png)
 
-In the next stage, the elements are compared to each other based on the criteria of the orientation of the lock, the length of the edges, the position of the center of the lock and finally the distance between the contours of both elements. On this basis, the program recommends the most promising candidates. 
+In the next step, the elements are compared to each other based on the criteria of the direction of the lock, the length of the edges, the position of the center of the lock and finally the distance between the contours of both elements. On this basis, the program recommends the most promising candidates. 
 
 ![load](img/load.png)
 
-After physically checking if the element fits, the user confirms the selection by building a puzzle map (visible in the puzzle.md file) with id of each puzzle (number of piece and after dot number of edge)
+After physically checking if the element fits, the user confirms the selection and gradually buils a puzzle map (visible in the puzzle.md file) with id of each puzzle (number of piece and after dot number of edge)
 
 ```txt
 |    |       1 |       2 |       3 |       4 |       5 |       6 |       7 |       8 | 
@@ -43,10 +43,10 @@ Example of incomplete puzzle
 
 ![incomplete](img/incomplete.jpg){width=25%}
 
-All free elements are arranged in a matrix: 3 sets each with dimensions 10x10 and numbered according to the set number (x100) and element.
+All unmatched blocks are arranged in a matrix: 3 sets each with dimensions 10x10 and numbered according to the set number and element (e.g. set id × 100 + piece id).
 
-![pieces](img/pieces.jpg){width=25%}
+![pieces](img/pieces.jpg)
 
 Example of a complete image
 
-![complete](img/complete.jpg){width=25%}
+![complete](img/complete.jpg)
